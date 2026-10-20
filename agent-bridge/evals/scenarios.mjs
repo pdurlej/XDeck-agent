@@ -14,7 +14,8 @@
  *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
  * 10. G4 articles — article search yields article.{title,preview} and/or media type article
  * 11. Bind listener — exactly one TCP listener on 18765 and it is 127.0.0.1 (not *)
- * 12. Bind restart — kill XDeck, relaunch within 5s; unauth /health → 401 within 15s (TIME_WAIT reclaim)
+ * 12. Bind restart — (opt-in) kill XDeck, relaunch within 5s; unauth /health → 401 within 15s
+ * 13. Eval remains gated — POST /eval on the bridge left running → HTTP 404 (never leave EVAL on)
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -22,7 +23,10 @@
  *   node evals/scenarios.mjs --column 0 --query openrig --polls 3
  *
  * Env: XDECK_AGENT_URL, XDECK_AGENT_TOKEN, XDECK_AGENT_TOKEN_FILE (same as CLI)
- *      XDECK_AGENT_EVAL must be unset for scenario 5 (default).
+ *      XDECK_AGENT_EVAL must be unset on the live XDeck app (scenario 5 + 13).
+ *      XDECK_EVAL_ALLOW_BRIDGE_KILL=1 required for scenario 12 — kills the :18765 holder.
+ *      Use a private DerivedData build for kill tests; do not kill Piotr’s shared bridge
+ *      while another reviewer is testing.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -1081,12 +1085,41 @@ async function scenario11BindListener() {
 }
 
 /**
+ * Best-effort: whether the holder process has XDECK_AGENT_EVAL set.
+ * macOS often hides environ; treat unknown as false (still never *add* EVAL on relaunch).
+ */
+function holderEnvHasAgentEval(pid) {
+  try {
+    const out = execFileSync("ps", ["eww", "-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+    });
+    return /\bXDECK_AGENT_EVAL=1\b/.test(out);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Kill the XDeck that owns :18765, relaunch the same .app within 5s, and require
  * unauthenticated GET /health → HTTP 401 within 15s (proves TIME_WAIT reclaim works).
+ *
+ * Opt-in only: set XDECK_EVAL_ALLOW_BRIDGE_KILL=1 on a *private* DerivedData instance.
+ * Never enable XDECK_AGENT_EVAL on relaunch (security: would leave HTTP /eval open).
  */
 async function scenario12BindRestart() {
   const port = 18765;
   const base = (process.env.XDECK_AGENT_URL || DEFAULT_BASE).replace(/\/$/, "");
+  const allowKill = String(process.env.XDECK_EVAL_ALLOW_BRIDGE_KILL || "") === "1";
+
+  if (!allowKill) {
+    return grade(
+      false,
+      true,
+      "skipped bind_restart kill — set XDECK_EVAL_ALLOW_BRIDGE_KILL=1 only on a private DerivedData bridge (never shared review sessions)",
+      { allowKill: false }
+    );
+  }
+
   let holderPid = null;
   let appPath = null;
   try {
@@ -1126,6 +1159,17 @@ async function scenario12BindRestart() {
     });
   }
 
+  // Refuse to kill obvious shared / Applications installs even with the opt-in flag.
+  if (/\/Applications\/XDeck\.app$/i.test(appPath) || /\/XDeck-agent-bridge\//i.test(appPath)) {
+    return grade(
+      false,
+      true,
+      `refusing to kill shared-looking bridge at ${appPath}`,
+      { holderPid, appPath }
+    );
+  }
+
+  const holderHadEval = holderEnvHasAgentEval(holderPid);
   const killStarted = nowMs();
   try {
     process.kill(holderPid, "SIGTERM");
@@ -1156,7 +1200,10 @@ async function scenario12BindRestart() {
     });
   }
 
-  const child = spawn("open", ["-n", "--env", "XDECK_AGENT=1", "--env", "XDECK_AGENT_EVAL=1", appPath], {
+  // Security: relaunch with ONLY XDECK_AGENT=1. Never pass XDECK_AGENT_EVAL — even if
+  // the killed holder had it (ps eww often cannot confirm). Leaving EVAL on a live
+  // logged-in session exposes POST /eval.
+  const child = spawn("open", ["-n", "--env", "XDECK_AGENT=1", appPath], {
     stdio: "ignore",
   });
   await new Promise((resolve) => child.once("exit", resolve));
@@ -1195,6 +1242,8 @@ async function scenario12BindRestart() {
       appPath,
       relaunchDelayMs,
       readyMs,
+      holderHadEval,
+      relaunchEnv: ["XDECK_AGENT=1"],
       listeners: after.listeners,
       lsof: after.stdout.trim(),
     });
@@ -1211,8 +1260,34 @@ async function scenario12BindRestart() {
       readyMs,
       lastStatus,
       lastError,
+      holderHadEval,
+      relaunchEnv: ["XDECK_AGENT=1"],
       listeners: after.listeners,
       lsof: after.stdout.trim(),
+    }
+  );
+}
+
+/** End-of-suite: HTTP eval must stay gated (404) on whatever bridge is left running. */
+async function scenario13EvalRemainsGated() {
+  const httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
+  const httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
+  const ok = httpEval.status === 404 && httpColEval.status === 404;
+  if (ok) {
+    return grade(true, false, "POST /eval and /columns/0/eval return 404 on live bridge", {
+      eval: httpEval.status,
+      columnEval: httpColEval.status,
+    });
+  }
+  return grade(
+    false,
+    false,
+    `HTTP eval must be 404 after suite (got /eval=${httpEval.status} /columns/0/eval=${httpColEval.status}) — relaunch XDeck with XDECK_AGENT=1 only`,
+    {
+      eval: httpEval.status,
+      columnEval: httpColEval.status,
+      evalBody: httpEval.body,
+      columnEvalBody: httpColEval.body,
     }
   );
 }
@@ -1332,8 +1407,17 @@ async function main() {
   };
   console.error(`  12 bind_restart: ${report.scenarios[12].status} — ${report.scenarios[12].reason}`);
 
-  // Leave column on home for the next human/agent session (best-effort after restart).
+  // Leave column on home for the next human/agent session (best-effort).
   await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
+
+  // Must run last: never leave HTTP eval enabled on the shared bridge.
+  report.scenarios[13] = {
+    name: "eval_remains_gated",
+    ...(await scenario13EvalRemainsGated()),
+  };
+  console.error(
+    `  13 eval_remains_gated: ${report.scenarios[13].status} — ${report.scenarios[13].reason}`
+  );
 
   report.finishedAt = new Date().toISOString();
   report.summary = {
@@ -1349,6 +1433,7 @@ async function main() {
     10: report.scenarios[10].status,
     11: report.scenarios[11].status,
     12: report.scenarios[12].status,
+    13: report.scenarios[13].status,
   };
 
   const out = JSON.stringify(report, null, 2);

@@ -28,10 +28,15 @@ Or: `npm run evals`
 | 4 | Write honesty | `POST /post_tweet`, `/reply`, `/retweet` → **HTTP 501** (never actually posts) |
 | 5 | Eval gate | MCP `tools/list` omits `eval_js` by default; `POST /eval` + `/columns/0/eval` → **HTTP 404** when `XDECK_AGENT_EVAL` unset |
 | 6 | read_column opts | Default response omits raw `text`; `limit=2` truncates cards; `includeText` opt-in works |
+| 11 | Bind listener | Exactly one TCP listener on `18765` and it is `127.0.0.1` |
+| 12 | Bind restart | **Opt-in** (`XDECK_EVAL_ALLOW_BRIDGE_KILL=1`): kill + relaunch private DerivedData app; unauth `/health` → **401** within 15s. Relaunch uses **only** `XDECK_AGENT=1` — never `XDECK_AGENT_EVAL`. |
+| 13 | Eval remains gated | End-of-suite: `POST /eval` → **404** on whatever bridge is left running |
 
 Exit code `1` if any scenario is `fail`; `partial` still exits `0`.
 
 ## Env
 
 Same as CLI/MCP: `XDECK_AGENT_URL`, `XDECK_AGENT_TOKEN`, `XDECK_AGENT_TOKEN_FILE`.  
-Scenario 5 expects `XDECK_AGENT_EVAL` **unset** on the running XDeck app (and harness clears it for the MCP spawn).
+Scenario 5 + 13 expect `XDECK_AGENT_EVAL` **unset** on the running XDeck app (and harness clears it for the MCP spawn).
+
+**Do not** kill Piotr’s shared `:18765` bridge during reviews. For TIME_WAIT restart tests, use a private DerivedData build and set `XDECK_EVAL_ALLOW_BRIDGE_KILL=1`. Without that flag, scenario 12 is skipped (`partial`).
