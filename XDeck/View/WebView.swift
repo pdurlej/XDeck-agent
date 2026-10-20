@@ -17,6 +17,10 @@ struct WebView: NSViewRepresentable {
     var refreshSwitch: Bool = false
     var configuration: WKWebViewConfiguration? = nil
 
+    /// When set, this WebView registers itself with `ColumnRegistry` for the agent bridge.
+    var columnIndex: Int? = nil
+    var columnType: String? = nil
+
     func makeNSView(context: Context) -> WKWebView {
         let webView: WKWebView
         if let configuration = configuration {
@@ -30,6 +34,19 @@ struct WebView: NSViewRepresentable {
         webView.uiDelegate = context.coordinator
         let request = URLRequest(url: url)
         webView.load(request)
+
+        if let columnIndex, let columnType {
+            Task { @MainActor in
+                ColumnRegistry.shared.register(
+                    index: columnIndex,
+                    type: columnType,
+                    webView: webView,
+                    url: url,
+                    isLoading: true
+                )
+            }
+        }
+
         return webView
     }
 
@@ -50,6 +67,20 @@ struct WebView: NSViewRepresentable {
         if webView.pageZoom != pageZoom {
             webView.pageZoom = CGFloat(pageZoom)
         }
+
+        if let columnIndex {
+            Task { @MainActor in
+                ColumnRegistry.shared.update(index: columnIndex, url: url, isLoading: isLoading)
+            }
+        }
+    }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+        if let columnIndex = coordinator.owner.columnIndex {
+            Task { @MainActor in
+                ColumnRegistry.shared.unregister(index: columnIndex, webView: nsView)
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -58,7 +89,7 @@ struct WebView: NSViewRepresentable {
 }
 
 class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-    private let owner: WebView
+    let owner: WebView
     var lastUrl: URL
     var refreshSwitch: Bool
     var lastHandledScriptToken: Int
@@ -75,9 +106,19 @@ class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
     // MARK: WKNavigationDelegate
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         owner.isLoading = true
+        if let columnIndex = owner.columnIndex {
+            Task { @MainActor in
+                ColumnRegistry.shared.update(index: columnIndex, url: owner.url, isLoading: true)
+            }
+        }
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         owner.isLoading = false
+        if let columnIndex = owner.columnIndex {
+            Task { @MainActor in
+                ColumnRegistry.shared.update(index: columnIndex, url: webView.url ?? owner.url, isLoading: false)
+            }
+        }
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if case .linkActivated = navigationAction.navigationType, let url = navigationAction.request.url {

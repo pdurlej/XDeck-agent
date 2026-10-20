@@ -24,6 +24,13 @@ struct XDeckApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     private let appConfig = AppConfig.loadConfig()
 
+    init() {
+        // Start early so the port is up before columns finish loading when XDECK_AGENT=1.
+        Task { @MainActor in
+            AgentBridge.shared.startIfEnabled()
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             if let appConfig {

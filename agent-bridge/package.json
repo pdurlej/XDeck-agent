@@ -1,0 +1,22 @@
+{
+  "name": "xdeck-agent-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stdio MCP + CLI for XDeck localhost agent bridge (read-only)",
+  "type": "module",
+  "bin": {
+    "xdeck-agent": "./cli.js",
+    "xdeck-agent-mcp": "./mcp-server.js"
+  },
+  "scripts": {
+    "mcp": "node mcp-server.js",
+    "cli": "node cli.js",
+    "smoke": "node scripts/smoke-mcp.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

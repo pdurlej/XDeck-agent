@@ -127,6 +127,8 @@ struct ContentView: View {
             return scripts
         }()
 
+        let columnTypeName = column.type.rawValue
+
         switch column.type {
         case .forYou:
             WebView(
@@ -136,7 +138,9 @@ struct ContentView: View {
                 scriptExecutionToken: scriptExecutionToken,
                 refreshSwitch: refreshSwitch,
                 configuration: WebViewConfigurations.makeConfiguration(
-                    onLoadScripts: baseConfiguration + [.clickForYouTab])
+                    onLoadScripts: baseConfiguration + [.clickForYouTab]),
+                columnIndex: columnIndex,
+                columnType: columnTypeName
             ).frame(width: width)
         case .following:
             WebView(
@@ -146,7 +150,9 @@ struct ContentView: View {
                 scriptExecutionToken: scriptExecutionToken,
                 refreshSwitch: refreshSwitch,
                 configuration: WebViewConfigurations.makeConfiguration(
-                    onLoadScripts: baseConfiguration + [.clickFollowingTab])
+                    onLoadScripts: baseConfiguration + [.clickFollowingTab]),
+                columnIndex: columnIndex,
+                columnType: columnTypeName
             ).frame(width: width)
         case .notifications:
             WebView(
@@ -157,7 +163,9 @@ struct ContentView: View {
                 scriptExecutionToken: scriptExecutionToken,
                 refreshSwitch: refreshSwitch,
                 configuration: WebViewConfigurations.makeConfiguration(
-                    onLoadScripts: baseConfiguration)
+                    onLoadScripts: baseConfiguration),
+                columnIndex: columnIndex,
+                columnType: columnTypeName
             ).frame(width: width)
         case .profile:
             if let url = Binding(profileUrl) {
@@ -168,7 +176,9 @@ struct ContentView: View {
                     scriptExecutionToken: column.isXColumn ? scriptExecutionToken : 0,
                     refreshSwitch: refreshSwitch,
                     configuration: WebViewConfigurations.makeConfiguration(
-                        onLoadScripts: baseConfiguration)
+                        onLoadScripts: baseConfiguration),
+                    columnIndex: columnIndex,
+                    columnType: columnTypeName
                 ).frame(width: width)
             }
         case .custom:
@@ -180,7 +190,9 @@ struct ContentView: View {
                     scriptExecutionToken: scriptExecutionToken,
                     refreshSwitch: refreshSwitch,
                     configuration: WebViewConfigurations.makeConfiguration(
-                        onLoadScripts: baseConfiguration)
+                        onLoadScripts: baseConfiguration),
+                    columnIndex: columnIndex,
+                    columnType: columnTypeName
                 ).frame(width: width)
             }
         }
@@ -315,6 +327,12 @@ struct ContentView: View {
 
                                 ScrollView(.horizontal) {
                                     HStack(spacing: 24) {
+                                        if AgentBridge.shared.isRunning {
+                                            Text("Agent :\(AgentBridge.shared.port)")
+                                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                                .foregroundColor(Color(hex: "#1D9BF0"))
+                                                .help("Localhost agent bridge is listening (XDECK_AGENT=1). Token in Application Support/XDeck/agent.token")
+                                        }
                                         HStack(spacing: 8) {
                                             Button {
                                                 openURL(URL(string: "https://github.com/morishin/XDeck")!)
@@ -433,6 +451,9 @@ struct ContentView: View {
                                 if let url = URL(string: "https://x.com/\(message.body)") {
                                     profileUrl = url
                                 }
+                                Task { @MainActor in
+                                    ColumnRegistry.shared.userHandle = message.body
+                                }
                             case .themeColor:
                                 let color = Color(hex: message.body)
                                 backgroundColor = color
@@ -451,6 +472,9 @@ struct ContentView: View {
                                 if let url = URL(string: "https://x.com/\(message.body)") {
                                     profileUrl = url
                                 }
+                                Task { @MainActor in
+                                    ColumnRegistry.shared.userHandle = message.body
+                                }
                             case .themeColor:
                                 let color = Color(hex: message.body)
                                 backgroundColor = color
@@ -467,6 +491,9 @@ struct ContentView: View {
                     }
                     .onChange(of: alertMessage) { message in
                         isShowingAlert = message != nil
+                    }
+                    .onAppear {
+                        AgentBridge.shared.startIfEnabled()
                     }
                 } // End of GeometryReader
     }
