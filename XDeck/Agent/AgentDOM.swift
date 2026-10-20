@@ -633,13 +633,17 @@ enum AgentDOM {
         var textEl = quoteRoot.querySelector('[data-testid="tweetText"]');
         var qText = textEl ? visibleText(textEl) : '';
         var st = recoverQuoteStatus(quoteRoot, article, primaryId, parsed.handle);
+        // N5: quoted X Articles often have empty tweetText — fill quoted.article
+        // the same way as top-level cards (title/preview from article card).
+        var qArticle = detectArticle(quoteRoot);
         var q = {
           handle: parsed.handle || (st && st.handle) || null,
           id: st ? st.id : null,
           url: st ? st.url : null,
           text: qText
         };
-        if (!q.handle && !q.text && !q.id) return null;
+        if (qArticle) q.article = qArticle;
+        if (!q.handle && !q.text && !q.id && !q.article) return null;
         return q;
       }
       function detectMedia(article, quoteRoot, hasArticle) {
@@ -789,30 +793,56 @@ enum AgentDOM {
         }
         return h;
       }
+      /**
+       * N1: Derive type from notification *cell chrome*, not tweet action buttons.
+       * Reply/mention cells embed a full tweet article (whose retweet/like SVGs
+       * must not classify the cell as repost/like). Repost/like/follow cells
+       * show a type icon in the header outside that article.
+       */
       function classifyType(cell, raw) {
         var lower = (raw || '').toLowerCase();
-        var paths = cell.querySelectorAll('svg path');
-        for (var i = 0; i < paths.length; i++) {
-          var d = paths[i].getAttribute('d') || '';
-          // Heart (like)
-          if (d.indexOf('M20.884') === 0 || d.indexOf('M16.697') === 0 ||
-              d.indexOf('M12 21.638') === 0) return 'like';
-          // Repost arrows
-          if (d.indexOf('M4.75 3.79') === 0 || d.indexOf('M4.5 3.88') === 0) return 'repost';
-          // Person/follow
-          if (d.indexOf('M17.863') === 0 || d.indexOf('M10 4c-1.105') === 0 ||
-              d.indexOf('M12.225') === 0) return 'follow';
+        var article = cell.querySelector('article[data-testid="tweet"]');
+        function iconTypeOutsideArticle() {
+          var paths = cell.querySelectorAll('svg path');
+          for (var i = 0; i < paths.length; i++) {
+            var pathEl = paths[i];
+            if (article && article.contains(pathEl)) continue;
+            // Also skip action-bar buttons if somehow outside article
+            var btn = pathEl.closest && pathEl.closest(
+              '[data-testid="reply"],[data-testid="retweet"],[data-testid="like"],[data-testid="unlike"],[data-testid="bookmark"],[data-testid="share"]'
+            );
+            if (btn) continue;
+            var d = pathEl.getAttribute('d') || '';
+            // Heart (like)
+            if (d.indexOf('M20.884') === 0 || d.indexOf('M16.697') === 0 ||
+                d.indexOf('M12 21.638') === 0) return 'like';
+            // Repost arrows
+            if (d.indexOf('M4.75 3.79') === 0 || d.indexOf('M4.5 3.88') === 0) return 'repost';
+            // Person/follow
+            if (d.indexOf('M17.863') === 0 || d.indexOf('M10 4c-1.105') === 0 ||
+                d.indexOf('M12.225') === 0) return 'follow';
+          }
+          return null;
         }
+        var chromeIcon = iconTypeOutsideArticle();
+        // Aggregation chrome wins when present (like/repost/follow of your posts).
+        if (chromeIcon) return chromeIcon;
         if (/liked|polubił|polubiła|polubili|gefällt|aimé|dio like/i.test(lower)) return 'like';
         if (/reposted|retweeted|poda[łl](a|i)?\s+dalej|hat retweetet|retweeteó/i.test(lower)) return 'repost';
         if (/followed|obserwuje|obserwują|folgt|suivi|empezó a seguir/i.test(lower)) return 'follow';
-        if (/mention|wspomnia[łl]|mentioned|mencion/i.test(lower)) return 'mention';
         if (/replied|odpowiedzia[łl]|répond|respondió/i.test(lower)) return 'reply';
-        if (cell.querySelector('article[data-testid="tweet"]') &&
-            /@/.test(lower) && /mention|wspomn|replied|odpowied/i.test(lower)) {
-          return /replied|odpowied/i.test(lower) ? 'reply' : 'mention';
+        if (/mention|wspomnia[łl]|mentioned|mencion/i.test(lower)) return 'mention';
+        // Full tweet article without aggregation chrome → reply or mention.
+        if (article) {
+          // inReplyTo / reply context on the embedded tweet → reply
+          var replyCtx = article.querySelector('[data-testid="socialContext"]');
+          var articleText = visibleText(article).toLowerCase();
+          if (replyCtx || /repli(?:ed|y)|odpowied|respond/i.test(articleText) ||
+              /replying to|w odpowiedzi|in reply to/i.test(articleText)) {
+            return 'reply';
+          }
+          return 'mention';
         }
-        if (cell.querySelector('article[data-testid="tweet"]')) return 'mention';
         return 'other';
       }
       function actorsFrom(cell) {
@@ -867,11 +897,23 @@ enum AgentDOM {
         }
         return actorsLen;
       }
+      /**
+       * N2: React status recovery must stay inside this cell.
+       * Never walk fiber.return / sibling / alternate — that inherits a
+       * neighbour notification's status id (e.g. every like → basal).
+       */
       function statusCandidatesFromReact(el) {
         var out = [];
         var seenIds = {};
         if (!el) return out;
         var seen = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+        var skipKeys = {
+          stateNode: 1, _owner: 1, containerInfo: 1,
+          return: 1, sibling: 1, alternate: 1, _debugOwner: 1,
+          dependencies: 1, lanes: 1, nextEffect: 1, firstEffect: 1,
+          lastEffect: 1, updateQueue: 1, queue: 1, lanesLane: 1,
+          childLanes: 1, memoizedState: 1
+        };
         function add(href) {
           var st = statusFromHref(href);
           if (!st || seenIds[st.id]) return;
@@ -879,7 +921,7 @@ enum AgentDOM {
           out.push(st);
         }
         function walk(node, depth) {
-          if (!node || depth > 16 || out.length > 8) return;
+          if (!node || depth > 12 || out.length > 6) return;
           if (typeof node === 'string') { add(node); return; }
           if (typeof node !== 'object') return;
           if (node.nodeType) return;
@@ -899,9 +941,17 @@ enum AgentDOM {
             }
           } catch (e) {}
           try {
+            // Prefer props bags over climbing the fiber tree.
+            if (node.memoizedProps) walk(node.memoizedProps, depth + 1);
+            if (node.pendingProps) walk(node.pendingProps, depth + 1);
+            // Descend into this fiber's child subtree only (not siblings/parents).
+            if (node.child) walk(node.child, depth + 1);
             for (var k in node) {
               if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
-              if (k === 'stateNode' || k === '_owner' || k === 'containerInfo') continue;
+              if (skipKeys[k]) continue;
+              if (k === 'memoizedProps' || k === 'pendingProps' || k === 'child') continue;
+              // Avoid walking DOM nodes / arrays of sibling fibers
+              if (k === 'children' && node.child) continue;
               try { walk(node[k], depth + 1); } catch (e) {}
             }
           } catch (e) {}
@@ -912,7 +962,17 @@ enum AgentDOM {
           if (key.indexOf('__reactFiber') !== 0 &&
               key.indexOf('__reactProps') !== 0 &&
               key.indexOf('__reactInternalInstance') !== 0) continue;
-          try { walk(el[key], 0); } catch (e) {}
+          try {
+            var root = el[key];
+            // For fibers: only props + descendant child chain.
+            if (root && typeof root === 'object' && (root.memoizedProps || root.pendingProps || root.tag != null)) {
+              if (root.memoizedProps) walk(root.memoizedProps, 0);
+              if (root.pendingProps) walk(root.pendingProps, 0);
+              if (root.child) walk(root.child, 0);
+            } else {
+              walk(root, 0);
+            }
+          } catch (e) {}
         }
         return out;
       }
@@ -920,47 +980,52 @@ enum AgentDOM {
         var article = cell.querySelector('article[data-testid="tweet"]');
         var scope = article || cell;
         var st = null;
-        // 1) Clean status <a> links (skip analytics/photo/…)
+        function acceptStatus(href, el) {
+          if (!href) return null;
+          if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) return null;
+          // N2: never accept a status link that is not inside this notification cell.
+          if (el && !cell.contains(el)) return null;
+          return statusFromHref(href);
+        }
+        // 1) Clean status <a> links scoped to the cell (skip analytics/photo/…)
         var links = scope.querySelectorAll('a[href*="/status/"], [href*="/status/"]');
         for (var i = 0; i < links.length; i++) {
-          var href = links[i].getAttribute('href') || '';
-          if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) continue;
-          st = statusFromHref(href);
+          if (!cell.contains(links[i])) continue;
+          st = acceptStatus(links[i].getAttribute('href') || '', links[i]);
           if (st) break;
         }
-        // 2) time → closest anchor (common on like/repost notification embeds)
+        // 2) time → closest anchor *inside the cell*
         if (!st) {
           var timeEl = scope.querySelector('time');
-          if (timeEl) {
+          if (timeEl && cell.contains(timeEl)) {
             var a = timeEl.closest && timeEl.closest('a[href]');
-            if (a) st = statusFromHref(a.getAttribute('href') || '');
+            if (a && cell.contains(a)) st = acceptStatus(a.getAttribute('href') || '', a);
             var p = timeEl.parentElement;
-            while (!st && p && p !== scope) {
-              if (p.tagName === 'A') st = statusFromHref(p.getAttribute('href') || '');
+            while (!st && p && cell.contains(p) && p !== cell) {
+              if (p.tagName === 'A') st = acceptStatus(p.getAttribute('href') || '', p);
               p = p.parentElement;
             }
           }
         }
-        // 3) role=link / any href attr on the cell
+        // 3) any href attr on the cell only
         if (!st) {
           var anyHref = cell.querySelectorAll('[href*="/status/"]');
           for (var h = 0; h < anyHref.length; h++) {
-            var hh = anyHref[h].getAttribute('href') || '';
-            if (/\/(analytics|photo|video|likes)(\/|$)/.test(hh)) continue;
-            st = statusFromHref(hh);
+            if (!cell.contains(anyHref[h])) continue;
+            st = acceptStatus(anyHref[h].getAttribute('href') || '', anyHref[h]);
             if (st) break;
           }
         }
         var text = '';
         var textEl = scope.querySelector('[data-testid="tweetText"]');
-        if (textEl) text = visibleText(textEl);
-        // 4) React fiber/props — like/repost embeds often omit status <a>.
-        // Only use when a tweet preview is present (avoid follow cells inheriting
-        // a neighboring status id from shared fiber state).
+        if (textEl && cell.contains(textEl)) text = visibleText(textEl);
+        // 4) React props on *this cell's* nodes only. If nothing in-cell → null id
+        // (prefer missing over a neighbour's basal status id).
         if (!st && text) {
           var cands = statusCandidatesFromReact(scope);
-          if (!cands.length) cands = statusCandidatesFromReact(cell);
-          if (cands.length) st = cands[0];
+          if (!cands.length && scope !== cell) cands = statusCandidatesFromReact(cell);
+          // Prefer a single unambiguous candidate; multiple ids often mean fiber bleed.
+          if (cands.length === 1) st = cands[0];
         }
         if (!st && !text) return null;
         var out = {};
@@ -1189,10 +1254,17 @@ enum AgentDOM {
       var statusPage = /\/[^/]+\/status\/\d+/i.test(path);
       var searchEmpty = searchPage && primary && tweets === 0 &&
         /no results|nie znaleziono|nothing matched|try searching for something else|brak wyników/i.test(lower);
-      // Only treat as settled-empty on explicit unavailable copy — never
+      // N4: X not-found page ("Hmm…this page doesn’t exist") — settle immediately,
+      // do not retry for ~54s. Distinct from mid-hydrate blank or Try-again shells.
+      var statusNotFound = statusPage && tweets === 0 && (
+        /hmm[.…]*.*this page doesn.?t exist|this page doesn.?t exist|page doesn.?t exist|doesn.?t exist.*try searching|ta strona nie istnieje|nie znaleziono (?:tej )?strony|strona nie istnieje/i.test(lower) ||
+        (primary && /try searching for something else/i.test(lower) &&
+          /doesn.?t exist|nie istnieje/i.test(lower))
+      );
+      // Only treat as settled-empty on explicit unavailable / not-found copy — never
       // "something went wrong" (too easy to false-positive mid-hydrate).
-      var statusEmpty = statusPage && primary && tweets === 0 &&
-        /this post (?:isn.?t|is not) available|this post is unavailable|post (?:is )?unavailable|post niedostępny|post doesn.?t exist|nie istnieje|can.?t find this post|nie można znaleźć/i.test(lower);
+      var statusEmpty = statusNotFound || (statusPage && primary && tweets === 0 &&
+        /this post (?:isn.?t|is not) available|this post is unavailable|post (?:is )?unavailable|post niedostępny|post doesn.?t exist|nie istnieje|can.?t find this post|nie można znaleźć/i.test(lower));
       var challenge = /\/i\/flow\/login|\/account\/access|arkose|funcaptcha/i.test(href) ||
         /verify you(?:'| a)?re (?:a )?human|confirm you(?:'| a)?re not a bot|complete the challenge/i.test(lower);
       // Search + status: only "ready" once tweets land (or documented empty) —
@@ -1208,6 +1280,7 @@ enum AgentDOM {
         statusPage: statusPage,
         searchEmpty: searchEmpty,
         statusEmpty: statusEmpty,
+        statusNotFound: statusNotFound,
         tweets: tweets,
         primary: primary,
         href: href,
