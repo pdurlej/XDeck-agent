@@ -15,7 +15,7 @@
  * 10. G4 articles — article search yields article.{title,preview} and/or media type article
  * 11. Bind listener — exactly one TCP listener on 18765 and it is 127.0.0.1 (not *)
  * 12. Bind restart — (opt-in) kill XDeck, relaunch within 5s; unauth /health → 401 within 15s
- * 13. Eval remains gated — POST /eval on the bridge left running → HTTP 404 (never leave EVAL on)
+ * 13. Eval remains gated — after hasWebView ready, POST /eval → 404 body contains "Eval disabled"
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -1318,7 +1318,9 @@ async function scenario12BindRestart() {
   // Security: relaunch with ONLY XDECK_AGENT=1. Never pass XDECK_AGENT_EVAL — even if
   // the killed holder had it (ps eww often cannot confirm). Leaving EVAL on a live
   // logged-in session exposes POST /eval.
-  const child = spawn("open", ["-n", "--env", "XDECK_AGENT=1", appPath], {
+  const relaunchEnv = ["XDECK_AGENT=1"];
+  const openArgs = ["-n", "--env", "XDECK_AGENT=1", appPath];
+  const child = spawn("open", openArgs, {
     stdio: "ignore",
   });
   await new Promise((resolve) => child.once("exit", resolve));
@@ -1358,7 +1360,7 @@ async function scenario12BindRestart() {
       relaunchDelayMs,
       readyMs,
       holderHadEval,
-      relaunchEnv: ["XDECK_AGENT=1"],
+      relaunchEnv,
       listeners: after.listeners,
       lsof: after.stdout.trim(),
     });
@@ -1376,7 +1378,7 @@ async function scenario12BindRestart() {
       lastStatus,
       lastError,
       holderHadEval,
-      relaunchEnv: ["XDECK_AGENT=1"],
+      relaunchEnv,
       listeners: after.listeners,
       lsof: after.stdout.trim(),
     }
