@@ -27,7 +27,7 @@
  * Env: XDECK_AGENT_URL, XDECK_AGENT_TOKEN, XDECK_AGENT_TOKEN_FILE (same as CLI)
  *      XDECK_AGENT_EVAL must be unset on the live XDeck app (scenario 5 + 13).
  *      XDECK_EVAL_ALLOW_BRIDGE_KILL=1 required for scenario 12 — kills the :18765 holder.
- *      Use a private DerivedData build for kill tests; do not kill Piotr’s shared bridge
+ *      Use a private DerivedData build for kill tests; do not kill a shared live bridge
  *      while another reviewer is testing.
  */
 import fs from "node:fs";
@@ -1008,7 +1008,7 @@ async function scenario8Notifications(column) {
   );
 
   // N2: when multiple targets have text, their ids must not all collapse to one
-  // neighbour id (basal bleed). Distinct texts ⇒ distinct ids when ids present.
+  // neighbour post id. Distinct texts ⇒ distinct ids when ids present.
   const targetsWithBoth = withTarget.filter(
     (e) =>
       typeof e.target?.text === "string" &&
@@ -1020,7 +1020,7 @@ async function scenario8Notifications(column) {
     targetsWithBoth.map((e) => e.target.text.slice(0, 80))
   );
   const uniqueIds = new Set(targetsWithBoth.map((e) => e.target.id));
-  // If ≥2 distinct target texts have ids, require ≥2 distinct ids (no universal basal).
+  // If ≥2 distinct target texts have ids, require ≥2 distinct ids (no universal neighbour post id).
   const perCellIdsOk =
     uniqueTexts.size < 2 || uniqueIds.size >= Math.min(2, uniqueTexts.size);
   // Prefer null over wrong: events with text may omit id — that is OK.
@@ -1082,7 +1082,7 @@ async function scenario8Notifications(column) {
 /** N4: nonexistent status must fail fast (not 2×16s retries ≈ 54s). */
 async function scenario14StatusNotFound(column) {
   const fakeId = "1999999999999999999";
-  const url = `https://x.com/pdurlej/status/${fakeId}`;
+  const url = `https://x.com/example/status/${fakeId}`;
   const nav = await timed(() => navigateColumn(column, url));
   if (!nav.ok) {
     return grade(false, false, `navigate failed: ${nav.error}`, { nav });
