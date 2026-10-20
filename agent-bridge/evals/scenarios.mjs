@@ -516,6 +516,127 @@ async function listMcpTools(env) {
   }
 }
 
+function errorText(body) {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  if (typeof body.error === "string") return body.error;
+  if (typeof body.message === "string") return body.message;
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return String(body);
+  }
+}
+
+/** True only for the intentional eval gate — not "Column N not found" 404s. */
+function isEvalDisabled404(res) {
+  return res?.status === 404 && /Eval disabled/i.test(errorText(res.body));
+}
+
+function isColumnNotFound404(res) {
+  const t = errorText(res?.body);
+  return (
+    res?.status === 404 &&
+    (/Column\s+\d+\s+not found/i.test(t) || /WebView not registered/i.test(t))
+  );
+}
+
+/** Wait until /health lists at least one column with hasWebView:true. */
+async function waitForWebViewColumns({ timeoutMs = 45000 } = {}) {
+  const deadline = nowMs() + timeoutMs;
+  let last = null;
+  while (nowMs() < deadline) {
+    const h = await timed(() => health());
+    last = h;
+    if (h.ok) {
+      const cols = Array.isArray(h.value?.columns) ? h.value.columns : [];
+      const ready = cols.filter((c) => c && c.hasWebView === true);
+      if (ready.length >= 1) {
+        return {
+          ok: true,
+          ms: timeoutMs - (deadline - nowMs()),
+          columnCount: cols.length,
+          readyCount: ready.length,
+          health: h.value,
+        };
+      }
+    }
+    await sleep(500);
+  }
+  return { ok: false, last };
+}
+
+/**
+ * After WebViews are registered: POST /eval must be 404 with body "Eval disabled".
+ * A Column-not-found 404 is retried, then failed — never treated as gated.
+ */
+async function assertHttpEvalDisabled() {
+  const ready = await waitForWebViewColumns();
+  if (!ready.ok) {
+    return {
+      ok: false,
+      reason:
+        "timed out waiting for /health columns with hasWebView:true before eval-disabled check",
+      evidence: { ready },
+    };
+  }
+
+  let httpEval = null;
+  let httpColEval = null;
+  let attempts = 0;
+  for (let i = 0; i < 8; i++) {
+    attempts = i + 1;
+    httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
+    httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
+    if (isColumnNotFound404(httpEval) || isColumnNotFound404(httpColEval)) {
+      await sleep(1000);
+      continue;
+    }
+    break;
+  }
+
+  if (isColumnNotFound404(httpEval) || isColumnNotFound404(httpColEval)) {
+    return {
+      ok: false,
+      reason:
+        "POST /eval still Column-not-found/WebView-not-registered 404 after wait — not a valid Eval disabled signal",
+      evidence: {
+        ready,
+        attempts,
+        httpEval: { status: httpEval.status, body: httpEval.body },
+        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      },
+    };
+  }
+
+  const disabled =
+    isEvalDisabled404(httpEval) && isEvalDisabled404(httpColEval);
+  if (disabled) {
+    return {
+      ok: true,
+      reason:
+        "POST /eval and /columns/0/eval return 404 with Eval disabled (after hasWebView ready)",
+      evidence: {
+        ready,
+        attempts,
+        httpEval: { status: httpEval.status, body: httpEval.body },
+        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    reason: `expected 404 Eval disabled after WebViews ready; got /eval=${httpEval.status} (${errorText(httpEval.body).slice(0, 120)}) /columns/0/eval=${httpColEval.status}`,
+    evidence: {
+      ready,
+      attempts,
+      httpEval: { status: httpEval.status, body: httpEval.body },
+      httpColEval: { status: httpColEval.status, body: httpColEval.body },
+    },
+  };
+}
+
 async function scenario5EvalGate() {
   const evalEnv = String(process.env.XDECK_AGENT_EVAL || "")
     .trim()
@@ -535,11 +656,7 @@ async function scenario5EvalGate() {
   }
   const evalAbsent = !mcp.names.includes("eval_js");
 
-  const httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
-  const httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
-  // Bridge returns 404 when XDECK_AGENT_EVAL unset (documented).
-  const http404 =
-    httpEval.status === 404 && httpColEval.status === 404;
+  const httpGate = await assertHttpEvalDisabled();
 
   if (evalOptIn) {
     // Suite still passes MCP default check; HTTP may be 200 if app also has EVAL.
@@ -553,28 +670,26 @@ async function scenario5EvalGate() {
       {
         mcpTools: mcp.names,
         evalAbsent,
-        httpEval: { status: httpEval.status, body: httpEval.body },
-        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+        httpGate,
         harnessEvalOptIn: true,
       }
     );
   }
 
-  const pass = evalAbsent && http404;
-  const partial = evalAbsent && !http404;
+  const pass = evalAbsent && httpGate.ok;
+  const partial = evalAbsent && !httpGate.ok;
   return grade(
     pass,
     partial,
     pass
-      ? "eval_js absent from tools/list; POST /eval and /columns/0/eval return 404"
+      ? "eval_js absent from tools/list; POST /eval returns 404 Eval disabled"
       : partial
-        ? `MCP omits eval_js but HTTP eval not 404 (got ${httpEval.status}/${httpColEval.status}) — rebuild app without XDECK_AGENT_EVAL`
-        : `eval gate failed: mcpHasEval=${!evalAbsent} http=${httpEval.status}/${httpColEval.status}`,
+        ? `MCP omits eval_js but HTTP gate failed: ${httpGate.reason}`
+        : `eval gate failed: mcpHasEval=${!evalAbsent}; ${httpGate.reason}`,
     {
       mcpTools: mcp.names,
       evalAbsent,
-      httpEval: { status: httpEval.status, body: httpEval.body },
-      httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      httpGate,
       harnessEvalOptIn: false,
     }
   );
@@ -1268,28 +1383,17 @@ async function scenario12BindRestart() {
   );
 }
 
-/** End-of-suite: HTTP eval must stay gated (404) on whatever bridge is left running. */
+/**
+ * End-of-suite: HTTP eval must stay gated on whatever bridge is left running.
+ * Requires hasWebView-ready columns, then 404 whose body contains "Eval disabled".
+ * Column-not-found 404 must never count as pass.
+ */
 async function scenario13EvalRemainsGated() {
-  const httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
-  const httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
-  const ok = httpEval.status === 404 && httpColEval.status === 404;
-  if (ok) {
-    return grade(true, false, "POST /eval and /columns/0/eval return 404 on live bridge", {
-      eval: httpEval.status,
-      columnEval: httpColEval.status,
-    });
+  const httpGate = await assertHttpEvalDisabled();
+  if (httpGate.ok) {
+    return grade(true, false, httpGate.reason, httpGate.evidence);
   }
-  return grade(
-    false,
-    false,
-    `HTTP eval must be 404 after suite (got /eval=${httpEval.status} /columns/0/eval=${httpColEval.status}) — relaunch XDeck with XDECK_AGENT=1 only`,
-    {
-      eval: httpEval.status,
-      columnEval: httpColEval.status,
-      evalBody: httpEval.body,
-      columnEvalBody: httpColEval.body,
-    }
-  );
+  return grade(false, false, httpGate.reason, httpGate.evidence);
 }
 
 async function main() {
