@@ -14,7 +14,7 @@ Fork of **[morishin/XDeck](https://github.com/morishin/XDeck)** under MIT. Unaff
 
 Upstream XDeck is an 𝕏 / TweetDeck-style multi-column macOS client. This repo keeps that app and adds Debug-only agent tooling (localhost bridge + MCP) so Cursor / Claude Code / Codex can inspect the same live WKWebView x.com session — no cookie export.
 
-> Prefer the **official X API / X MCP** if you need search products or writes. Honest red-team notes live in the companion Project (`xdeck-agent-redteam.md`).
+> Prefer the **official X API / X MCP** if you need search products or writes.
 
 <img width="120" height="120" alt="XDeck icon" src="https://github.com/user-attachments/assets/b0076952-c7b4-4024-a337-8df37c05f88c" />
 
