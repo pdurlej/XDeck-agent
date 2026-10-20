@@ -20,3 +20,4 @@ agent-bridge/node_modules/
 **/agent.token
 **/agent-bridge.log
 .DS_Store
+DerivedData/

@@ -478,8 +478,11 @@ final class AgentBridge {
             throw AgentBridgeError.badRequest("Missing or invalid url (http/https only)")
         }
         let column = try columnFromBody(obj, defaultColumn: defaultColumn)
-        try await ColumnRegistry.shared.navigate(column: column, to: url)
-        return (200, #"{"ok":true,"column":\#(column),"url":\#(Self.jsonString(url.absoluteString))}"#)
+        let result = try await ColumnRegistry.shared.navigate(column: column, to: url)
+        // HTTP 200 with ok:false when SPA did not become ready — agents should read fields.
+        return (200, """
+        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs)}
+        """)
     }
 
     private func handleScroll(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
