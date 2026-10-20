@@ -3,7 +3,8 @@
  * Live scenario eval suite against Debug XDeck agent bridge (:18765).
  *
  * Scenarios (honest pass / partial / fail):
- *  1. Feed browse — health ok + structured tweets OR honest empty; needs_human false on healthy home
+ *  1. Feed browse — settle after relaunch: wait for structured tweets OR stable honest empty
+ *     (not mid-hydration blank home with needs_human=true)
  *  2. Topic search — navigate_column to search URL, ready, tweets ≥1 OR documented SPA fail
  *  3. Periodic poll — 2–3 read_column cycles with stable ids / diff; no crash
  *  4. Write honesty — post/reply/retweet return HTTP 501 (do NOT actually post)
@@ -139,64 +140,160 @@ function grade(pass, partial, reason, evidence) {
   return { status, reason, evidence };
 }
 
+/**
+ * Feed browse after relaunch: WebViews often report ok=true, tweets=0, needs_human=true
+ * while home is still hydrating. Wait/retry (same spirit as status settle / hasWebView)
+ * until structured tweets appear OR a stable honest empty (needs_human=false).
+ */
 async function scenario1FeedBrowse(column) {
-  const h = await timed(() => health());
-  if (!h.ok) {
-    return grade(false, false, `health unreachable: ${h.error}`, { health: h });
+  // Best-effort home — after kill/relaunch column 0 may still be about:blank.
+  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
+
+  const wv = await waitForWebViewColumns({ timeoutMs: 45000 });
+  if (!wv.ok) {
+    return grade(
+      false,
+      false,
+      "timed out waiting for /health columns with hasWebView:true before feed browse",
+      { webViews: wv }
+    );
   }
-  const healthBody = h.value;
-  const read = await timed(() => readColumn(column, { includeText: false }));
-  if (!read.ok) {
-    return grade(false, false, `read_column failed: ${read.error}`, {
-      healthMs: h.ms,
-      health: {
-        ok: healthBody.ok,
-        user: healthBody.user,
-        needs_human: healthBody.needs_human,
-        columnCount: healthBody.columnCount,
-      },
-      read,
+
+  const attempts = 12;
+  const delayMs = 800;
+  let lastHealth = null;
+  let lastRead = null;
+  let settleAttempts = 0;
+
+  for (let a = 0; a < attempts; a++) {
+    settleAttempts = a + 1;
+    const h = await timed(() => health());
+    if (!h.ok) {
+      return grade(false, false, `health unreachable: ${h.error}`, {
+        health: h,
+        settleAttempts,
+        webViews: { readyCount: wv.readyCount },
+      });
+    }
+    lastHealth = h;
+    const healthBody = h.value;
+
+    const read = await timed(() => readColumn(column, { includeText: false }));
+    lastRead = read;
+    if (!read.ok) {
+      // Transient read failures during SPA boot — retry.
+      await sleep(delayMs);
+      continue;
+    }
+
+    const tweetCount =
+      read.value.tweetCount ??
+      (Array.isArray(read.value.tweets) ? read.value.tweets.length : 0);
+    const needsHuman = read.value.needs_human === true;
+    const healthNeedsHuman = healthBody.needs_human === true;
+    const healthyHome =
+      healthBody.ok === true && !healthNeedsHuman && !needsHuman;
+    const hasTweets = tweetCount >= 1;
+    const honestEmpty =
+      tweetCount === 0 &&
+      needsHuman === false &&
+      Array.isArray(read.value.tweets);
+
+    // Mid-hydration blank home: ok but empty + needs_human — keep settling.
+    const midHydration =
+      healthBody.ok === true &&
+      tweetCount === 0 &&
+      (needsHuman || healthNeedsHuman);
+
+    if (healthyHome && (hasTweets || honestEmpty)) {
+      return grade(
+        true,
+        false,
+        hasTweets
+          ? `health ok, ${tweetCount} structured tweets, needs_human=false (settleAttempts=${settleAttempts})`
+          : `health ok, honest empty tweet list, needs_human=false (settleAttempts=${settleAttempts})`,
+        {
+          healthMs: h.ms,
+          readMs: read.ms,
+          settleAttempts,
+          user: healthBody.user,
+          healthNeedsHuman,
+          needs_human: needsHuman,
+          tweetCount,
+          sampleIds: tweetIds(read.value).slice(0, 5),
+          challenge: read.value.challenge ?? null,
+        }
+      );
+    }
+
+    if (midHydration) {
+      await sleep(delayMs);
+      continue;
+    }
+
+    // Tweets present but still flagged needs_human — stable enough for partial.
+    if (
+      healthBody.ok === true &&
+      (hasTweets || honestEmpty) &&
+      (needsHuman || healthNeedsHuman)
+    ) {
+      return grade(
+        false,
+        true,
+        `tweets readable but needs_human flagged (health=${healthNeedsHuman}, read=${needsHuman}, settleAttempts=${settleAttempts})`,
+        {
+          healthMs: h.ms,
+          readMs: read.ms,
+          settleAttempts,
+          user: healthBody.user,
+          healthNeedsHuman,
+          needs_human: needsHuman,
+          tweetCount,
+          sampleIds: tweetIds(read.value).slice(0, 5),
+          challenge: read.value.challenge ?? null,
+        }
+      );
+    }
+
+    await sleep(delayMs);
+  }
+
+  // Exhausted settle window — grade from last snapshot.
+  if (!lastHealth?.ok) {
+    return grade(false, false, `health unreachable after settle: ${lastHealth?.error}`, {
+      health: lastHealth,
+      settleAttempts,
     });
   }
-  const tweetCount =
-    read.value.tweetCount ??
-    (Array.isArray(read.value.tweets) ? read.value.tweets.length : 0);
-  const needsHuman = read.value.needs_human === true;
-  const healthNeedsHuman = healthBody.needs_human === true;
-  const healthyHome =
-    healthBody.ok === true && !healthNeedsHuman && !needsHuman;
-  const hasTweets = tweetCount >= 1;
-  const honestEmpty =
-    tweetCount === 0 &&
-    needsHuman === false &&
-    Array.isArray(read.value.tweets);
+  if (!lastRead?.ok) {
+    return grade(false, false, `read_column failed after settle: ${lastRead?.error}`, {
+      healthMs: lastHealth.ms,
+      read: lastRead,
+      settleAttempts,
+    });
+  }
 
-  const pass = healthyHome && (hasTweets || honestEmpty);
-  const partial =
-    !pass &&
-    healthBody.ok === true &&
-    (hasTweets || honestEmpty) &&
-    (needsHuman || healthNeedsHuman);
+  const healthBody = lastHealth.value;
+  const tweetCount =
+    lastRead.value.tweetCount ??
+    (Array.isArray(lastRead.value.tweets) ? lastRead.value.tweets.length : 0);
+  const needsHuman = lastRead.value.needs_human === true;
+  const healthNeedsHuman = healthBody.needs_human === true;
 
   return grade(
-    pass,
-    partial,
-    pass
-      ? hasTweets
-        ? `health ok, ${tweetCount} structured tweets, needs_human=false`
-        : "health ok, honest empty tweet list, needs_human=false"
-      : partial
-        ? `tweets readable but needs_human flagged (health=${healthNeedsHuman}, read=${needsHuman})`
-        : `failed: ok=${healthBody.ok} tweets=${tweetCount} needs_human health/read=${healthNeedsHuman}/${needsHuman}`,
+    false,
+    false,
+    `failed after settle: ok=${healthBody.ok} tweets=${tweetCount} needs_human health/read=${healthNeedsHuman}/${needsHuman} (settleAttempts=${settleAttempts})`,
     {
-      healthMs: h.ms,
-      readMs: read.ms,
+      healthMs: lastHealth.ms,
+      readMs: lastRead.ms,
+      settleAttempts,
       user: healthBody.user,
       healthNeedsHuman,
       needs_human: needsHuman,
       tweetCount,
-      sampleIds: tweetIds(read.value).slice(0, 5),
-      challenge: read.value.challenge ?? null,
+      sampleIds: tweetIds(lastRead.value).slice(0, 5),
+      challenge: lastRead.value.challenge ?? null,
     }
   );
 }
