@@ -119,17 +119,21 @@ export async function evalJs(column, js) {
   });
 }
 
-export async function navigateColumn(column, url) {
+export async function navigateColumn(column, url, { agentId } = {}) {
+  const body = { column, url };
+  if (agentId) body.agentId = agentId;
   return bridgeFetch("/navigate", {
     method: "POST",
-    body: { column, url },
+    body,
   });
 }
 
-export async function scrollColumn(column, deltaY = 800) {
+export async function scrollColumn(column, deltaY = 800, { agentId } = {}) {
+  const body = { column, deltaY };
+  if (agentId) body.agentId = agentId;
   return bridgeFetch("/scroll", {
     method: "POST",
-    body: { column, deltaY },
+    body,
   });
 }
 
@@ -137,6 +141,25 @@ export async function reloadColumn(column) {
   return bridgeFetch("/reload", {
     method: "POST",
     body: { column },
+  });
+}
+
+export async function acquireColumn(agentId, { ttl } = {}) {
+  const body = { agentId };
+  if (typeof ttl === "number") body.ttl = ttl;
+  return bridgeFetch("/acquire_column", {
+    method: "POST",
+    body,
+  });
+}
+
+export async function releaseColumn({ agentId, column } = {}) {
+  const body = {};
+  if (agentId) body.agentId = agentId;
+  if (typeof column === "number") body.column = column;
+  return bridgeFetch("/release_column", {
+    method: "POST",
+    body,
   });
 }
 

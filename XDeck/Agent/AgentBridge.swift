@@ -589,6 +589,10 @@ final class AgentBridge: ObservableObject {
             try requireEvalEnabled()
             let index = try parseColumnIndex(path: path, suffix: "/eval")
             return try await handleEval(body: body, defaultColumn: index)
+        case ("POST", "/acquire_column"), ("POST", "/columns/acquire"):
+            return try handleAcquireColumn(body: body)
+        case ("POST", "/release_column"), ("POST", "/columns/release"):
+            return try handleReleaseColumn(body: body)
         case ("POST", "/navigate"):
             return try await handleNavigate(body: body, defaultColumn: nil)
         case ("POST", _) where path.hasPrefix("/columns/") && path.hasSuffix("/navigate"):
@@ -728,6 +732,45 @@ final class AgentBridge: ObservableObject {
         throw AgentBridgeError.badRequest("Missing column index")
     }
 
+    private func agentIdFromBody(_ obj: [String: Any]) -> String? {
+        if let s = obj["agentId"] as? String { return s }
+        if let s = obj["agent_id"] as? String { return s }
+        return nil
+    }
+
+    private func handleAcquireColumn(body: Data) throws -> (Int, String) {
+        guard let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            throw AgentBridgeError.badRequest("JSON body required: { \"agentId\": \"…\", \"ttl\": 120 }")
+        }
+        guard let agentId = agentIdFromBody(obj)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !agentId.isEmpty else {
+            throw AgentBridgeError.badRequest("Missing agentId")
+        }
+        var ttl: TimeInterval?
+        if let n = obj["ttl"] as? Double { ttl = n }
+        else if let n = obj["ttl"] as? Int { ttl = TimeInterval(n) }
+        else if let n = obj["ttl"] as? NSNumber { ttl = n.doubleValue }
+        else if let n = obj["ttlSeconds"] as? Double { ttl = n }
+        else if let n = obj["ttlSeconds"] as? Int { ttl = TimeInterval(n) }
+        else if let n = obj["ttlSeconds"] as? NSNumber { ttl = n.doubleValue }
+        let result = try AgentColumnLeases.shared.acquire(agentId: agentId, ttlSeconds: ttl)
+        let expiresISO = ISO8601DateFormatter().string(from: result.expiresAt)
+        return (200, """
+        {"ok":true,"column":\(result.column),"agentId":\(Self.jsonString(result.agentId)),"ttlSeconds":\(result.ttlSeconds),"expiresAt":\(Self.jsonString(expiresISO)),"renewed":\(result.renewed ? "true" : "false"),"type":"agent","visible":false}
+        """)
+    }
+
+    private func handleReleaseColumn(body: Data) throws -> (Int, String) {
+        let obj = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+        let agentId = agentIdFromBody(obj)
+        var column: Int?
+        if let n = obj["column"] as? Int { column = n }
+        else if let n = obj["column"] as? NSNumber { column = n.intValue }
+        let released = try AgentColumnLeases.shared.release(agentId: agentId, column: column)
+        let cols = released.map(String.init).joined(separator: ",")
+        return (200, #"{"ok":true,"released":[\#(cols)],"count":\#(released.count)}"#)
+    }
+
     private func handleNavigate(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
         guard let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             throw AgentBridgeError.badRequest("JSON body required: { \"url\": \"https://x.com/...\", \"column\": 0 }")
@@ -739,7 +782,12 @@ final class AgentBridge: ObservableObject {
             throw AgentBridgeError.badRequest("Missing or invalid url (http/https only)")
         }
         let column = try columnFromBody(obj, defaultColumn: defaultColumn)
+        let agentId = agentIdFromBody(obj)
+        try AgentColumnLeases.shared.requireUserNavAllowed(column: column)
+        try AgentColumnLeases.shared.requireAgentLease(column: column, agentId: agentId)
+        try AgentColumnLeases.shared.requireNavPacing(column: column)
         let result = try await ColumnRegistry.shared.navigate(column: column, to: url)
+        AgentColumnLeases.shared.markNavigated(column: column)
         // HTTP 200 with ok:false when SPA did not become ready — agents should read fields.
         let repliesLoadedJSON: String = {
             if let flag = result.repliesLoaded {
@@ -755,6 +803,9 @@ final class AgentBridge: ObservableObject {
     private func handleScroll(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
         let obj = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
         let column = try columnFromBody(obj, defaultColumn: defaultColumn)
+        let agentId = agentIdFromBody(obj)
+        try AgentColumnLeases.shared.requireUserNavAllowed(column: column)
+        try AgentColumnLeases.shared.requireAgentLease(column: column, agentId: agentId)
         var delta = 800
         if let n = obj["deltaY"] as? Int { delta = n }
         else if let n = obj["deltaY"] as? NSNumber { delta = n.intValue }
@@ -842,23 +893,41 @@ final class AgentBridge: ObservableObject {
             }
             // Re-read flags after card-count refresh.
             let flags = ColumnRegistry.shared.hydrateFlags(forColumn: col.index)
+            let lease = AgentColumnLeases.shared.lease(for: col.index)
+            let leaseJSON: String
+            if let lease {
+                let expiresISO = ISO8601DateFormatter().string(from: lease.expiresAt)
+                leaseJSON = #"{"agentId":\#(Self.jsonString(lease.agentId)),"expiresAt":\#(Self.jsonString(expiresISO)),"remainingSeconds":\#(lease.remainingSeconds)}"#
+            } else {
+                leaseJSON = "null"
+            }
             colParts.append(
                 """
-                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"visibilityState":\(visibilityState),"hydrating":\(flags.hydrating ? "true" : "false"),"stale":\(flags.stale ? "true" : "false"),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
+                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"visible":\(col.visible ? "true" : "false"),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"visibilityState":\(visibilityState),"hydrating":\(flags.hydrating ? "true" : "false"),"stale":\(flags.stale ? "true" : "false"),"needs_human":\(needsHuman ? "true" : "false"),"lease":\(leaseJSON),"challenge":\(challengeJSON)}
                 """
             )
         }
         let cols = colParts.joined(separator: ",")
+        let leases = AgentColumnLeases.shared
         return """
-        {"ok":true,"agent":true,"port":\(port),"user":\(userJSON),"needs_human":\(anyNeedsHuman ? "true" : "false"),"columns":[\(cols)],"columnCount":\(columns.count),"token_stable":true}
+        {"ok":true,"agent":true,"port":\(port),"user":\(userJSON),"needs_human":\(anyNeedsHuman ? "true" : "false"),"columns":[\(cols)],"columnCount":\(columns.count),"agentColumnCount":\(leases.columnCount),"agentColumnBase":\(leases.baseIndex),"navMinIntervalMs":\(Int(leases.navMinInterval * 1000)),"allowUserNav":\(leases.allowUserNav ? "true" : "false"),"token_stable":true}
         """
     }
 
     private func columnsJSON() -> String {
+        AgentColumnLeases.shared.reclaimExpired()
         let columns = ColumnRegistry.shared.snapshot()
         let cols = columns.map { col -> String in
-            """
-            {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"hydrating":\(col.hydrating ? "true" : "false"),"stale":\(col.stale ? "true" : "false")}
+            let lease = AgentColumnLeases.shared.lease(for: col.index)
+            let leaseJSON: String
+            if let lease {
+                let expiresISO = ISO8601DateFormatter().string(from: lease.expiresAt)
+                leaseJSON = #"{"agentId":\#(Self.jsonString(lease.agentId)),"expiresAt":\#(Self.jsonString(expiresISO)),"remainingSeconds":\#(lease.remainingSeconds)}"#
+            } else {
+                leaseJSON = "null"
+            }
+            return """
+            {"index":\(col.index),"type":\(Self.jsonString(col.type)),"visible":\(col.visible ? "true" : "false"),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"hydrating":\(col.hydrating ? "true" : "false"),"stale":\(col.stale ? "true" : "false"),"lease":\(leaseJSON)}
             """
         }.joined(separator: ",")
         return #"{"columns":[\#(cols)]}"#
@@ -870,9 +939,12 @@ final class AgentBridge: ObservableObject {
         case 200: reason = "OK"
         case 400: reason = "Bad Request"
         case 401: reason = "Unauthorized"
+        case 403: reason = "Forbidden"
         case 404: reason = "Not Found"
         case 405: reason = "Method Not Allowed"
+        case 409: reason = "Conflict"
         case 413: reason = "Payload Too Large"
+        case 429: reason = "Too Many Requests"
         case 501: reason = "Not Implemented"
         default: reason = "Error"
         }

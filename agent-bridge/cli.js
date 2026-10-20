@@ -7,6 +7,8 @@ import {
   navigateColumn,
   scrollColumn,
   reloadColumn,
+  acquireColumn,
+  releaseColumn,
   tokenPath,
   DEFAULT_BASE,
 } from "./lib/client.js";
@@ -18,8 +20,10 @@ Usage:
   xdeck-agent health
   xdeck-agent columns
   xdeck-agent read <columnIndex> [--text] [--limit N] [--max-chars N]
-  xdeck-agent navigate <columnIndex> <url>
-  xdeck-agent scroll <columnIndex> [deltaY]
+  xdeck-agent acquire <agentId> [--ttl seconds]
+  xdeck-agent release [--agent <agentId>] [--column N]
+  xdeck-agent navigate <columnIndex> <url> [--agent <agentId>]
+  xdeck-agent scroll <columnIndex> [deltaY] [--agent <agentId>]
   xdeck-agent reload <columnIndex>
   xdeck-agent eval <columnIndex> <js>
 
@@ -29,6 +33,14 @@ Env:
   XDECK_AGENT_TOKEN_FILE   default ${tokenPath()}
 `);
   process.exit(1);
+}
+
+function takeFlag(rest, name) {
+  const idx = rest.indexOf(name);
+  if (idx < 0) return undefined;
+  const value = rest[idx + 1];
+  rest.splice(idx, 2);
+  return value;
 }
 
 async function main() {
@@ -66,18 +78,61 @@ async function main() {
         );
         break;
       }
+      case "acquire": {
+        const agentId = rest[0];
+        if (!agentId) usage();
+        const ttlRaw = takeFlag(rest, "--ttl");
+        const ttl = ttlRaw !== undefined ? Number(ttlRaw) : undefined;
+        console.log(
+          JSON.stringify(await acquireColumn(agentId, { ttl }), null, 2)
+        );
+        break;
+      }
+      case "release": {
+        const agentId = takeFlag(rest, "--agent") || rest[0];
+        const columnRaw = takeFlag(rest, "--column");
+        const column =
+          columnRaw !== undefined ? Number(columnRaw) : undefined;
+        console.log(
+          JSON.stringify(
+            await releaseColumn({
+              agentId,
+              column: Number.isInteger(column) ? column : undefined,
+            }),
+            null,
+            2
+          )
+        );
+        break;
+      }
       case "navigate": {
-        const index = Number(rest[0]);
-        const url = rest[1];
+        const args = [...rest];
+        const agentId = takeFlag(args, "--agent");
+        const index = Number(args[0]);
+        const url = args[1];
         if (!Number.isInteger(index) || !url) usage();
-        console.log(JSON.stringify(await navigateColumn(index, url), null, 2));
+        console.log(
+          JSON.stringify(
+            await navigateColumn(index, url, { agentId }),
+            null,
+            2
+          )
+        );
         break;
       }
       case "scroll": {
-        const index = Number(rest[0]);
-        const delta = rest[1] !== undefined ? Number(rest[1]) : 800;
+        const args = [...rest];
+        const agentId = takeFlag(args, "--agent");
+        const index = Number(args[0]);
+        const delta = args[1] !== undefined ? Number(args[1]) : 800;
         if (!Number.isInteger(index)) usage();
-        console.log(JSON.stringify(await scrollColumn(index, delta), null, 2));
+        console.log(
+          JSON.stringify(
+            await scrollColumn(index, delta, { agentId }),
+            null,
+            2
+          )
+        );
         break;
       }
       case "reload": {

@@ -16,6 +16,8 @@ import {
   navigateColumn,
   scrollColumn,
   reloadColumn,
+  acquireColumn,
+  releaseColumn,
 } from "./lib/client.js";
 
 const READ_ONLY = {
@@ -140,20 +142,84 @@ server.registerTool(
 );
 
 server.registerTool(
+  "acquire_column",
+  {
+    title: "Acquire agent column lease",
+    description:
+      "Lease a free agent-only hidden column (indices 100+ by default; type=agent, visible=false). Same logged-in WebKit session as the human deck. Returns column index + TTL. Concurrent agents get different columns; if none free → HTTP 409. Pass the same agentId to navigate_column / scroll_column.",
+    inputSchema: {
+      agent_id: z
+        .string()
+        .min(1)
+        .describe("Stable id for this agent client (lease holder)"),
+      ttl: z
+        .number()
+        .positive()
+        .max(600)
+        .optional()
+        .describe("Lease TTL in seconds (default 120, max 600)"),
+    },
+    annotations: NAV_ONLY,
+  },
+  async ({ agent_id, ttl }) => {
+    try {
+      return jsonResult(await acquireColumn(agent_id, { ttl }));
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+);
+
+server.registerTool(
+  "release_column",
+  {
+    title: "Release agent column lease",
+    description:
+      "Release an agent column lease by agent_id and/or column index so another client can acquire it.",
+    inputSchema: {
+      agent_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Lease holder id (releases all columns for this agent)"),
+      column: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Specific agent column index to release"),
+    },
+    annotations: NAV_ONLY,
+  },
+  async ({ agent_id, column }) => {
+    try {
+      return jsonResult(await releaseColumn({ agentId: agent_id, column }));
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+);
+
+server.registerTool(
   "navigate_column",
   {
     title: "Navigate column URL",
     description:
-      "Navigate a column to an http(s) URL (e.g. https://x.com/search?q=openrig&src=typed_query&f=live or a /status/ URL). Prefers in-SPA search-box submit, waits for tweets/ready on search and status pages, retries SPA error shells. Returns ok/ready/tweetCount/method/waitedMs. Then call read_column.",
+      "Navigate a column to an http(s) URL (e.g. https://x.com/search?q=openrig&src=typed_query&f=live or a /status/ URL). User columns 0–n are refused by default (403) — use acquire_column + agent column + agent_id. Agent columns require a matching lease. Min navigation interval per agent column (default 5s). Returns ok/ready/tweetCount/method/waitedMs. Then call read_column.",
     inputSchema: {
-      column: z.number().int().min(0).describe("Column index (0-based)"),
+      column: z.number().int().min(0).describe("Column index (0-based; agent columns typically 100+)"),
       url: z.string().url().describe("Absolute http(s) URL to load"),
+      agent_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Required for agent columns — must match the lease holder"),
     },
     annotations: NAV_ONLY,
   },
-  async ({ column, url }) => {
+  async ({ column, url, agent_id }) => {
     try {
-      return jsonResult(await navigateColumn(column, url));
+      return jsonResult(await navigateColumn(column, url, { agentId: agent_id }));
     } catch (err) {
       return errorResult(err);
     }
@@ -165,7 +231,7 @@ server.registerTool(
   {
     title: "Scroll column",
     description:
-      "Scroll the column's timeline viewport (positive deltaY = down). Use after navigate/read to load more tweets.",
+      "Scroll the column's timeline viewport (positive deltaY = down). User columns refused by default (403). Agent columns require matching agent_id lease.",
     inputSchema: {
       column: z.number().int().min(0).describe("Column index (0-based)"),
       delta_y: z
@@ -173,12 +239,19 @@ server.registerTool(
         .int()
         .optional()
         .describe("Pixels to scroll (default 800)"),
+      agent_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Required for agent columns — must match the lease holder"),
     },
     annotations: NAV_ONLY,
   },
-  async ({ column, delta_y }) => {
+  async ({ column, delta_y, agent_id }) => {
     try {
-      return jsonResult(await scrollColumn(column, delta_y ?? 800));
+      return jsonResult(
+        await scrollColumn(column, delta_y ?? 800, { agentId: agent_id })
+      );
     } catch (err) {
       return errorResult(err);
     }

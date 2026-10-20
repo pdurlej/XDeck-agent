@@ -43,7 +43,11 @@ node /absolute/path/to/XDeck-agent/agent-bridge/mcp-server.js
 | `navigate_column` | Load URL in column |
 | `scroll_column` | Scroll timeline |
 | `reload_column` | Reload WebView |
+| `acquire_column` | Lease a free **agent-only** hidden column (indices 100+, `type=agent`, `visible=false`) |
+| `release_column` | Release an agent column lease by `agent_id` / column |
 | `eval_js` | **Opt-in** (`XDECK_AGENT_EVAL=1`); arbitrary JS — **can mutate**; HTTP `/eval` returns **404** when unset |
+
+**Protecting the human deck:** `navigate_column` / `scroll_column` on user columns (0–n) return **403** unless `XDECK_AGENT_ALLOW_USER_NAV=1`. Prefer `acquire_column` → navigate/scroll with matching `agent_id`. Agent columns share the same WebKit cookie jar; they stay attached (near-invisible) so `document.visibilityState` remains `visible`. Min navigation interval per agent column: `XDECK_AGENT_NAV_MIN_INTERVAL_MS` (default 5000).
 
 ## CLI
 

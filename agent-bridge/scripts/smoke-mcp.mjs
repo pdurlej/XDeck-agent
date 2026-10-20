@@ -75,10 +75,12 @@ async function main() {
     if (listed.error) throw new Error(JSON.stringify(listed.error));
     const names = (listed.result?.tools || []).map((t) => t.name).sort();
     const expected = [
+      "acquire_column",
       "health",
       "list_columns",
       "navigate_column",
       "read_column",
+      "release_column",
       "reload_column",
       "scroll_column",
     ];

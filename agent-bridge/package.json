@@ -12,7 +12,8 @@
     "mcp": "node mcp-server.js",
     "cli": "node cli.js",
     "smoke": "node scripts/smoke-mcp.mjs",
-    "evals": "node evals/scenarios.mjs"
+    "evals": "node evals/scenarios.mjs",
+    "evals:agent-columns": "node evals/agent-columns.mjs"
   },
   "engines": {
     "node": ">=18"
