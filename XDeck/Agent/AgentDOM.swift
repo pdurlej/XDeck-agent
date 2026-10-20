@@ -23,7 +23,7 @@ enum AgentDOM {
       /** Prefer /status/<id>; strip /analytics|/photo|/video|/likes suffixes. */
       function statusFromHref(href) {
         if (!href) return null;
-        var m = String(href).match(/\/([A-Za-z0-9_]+)\/status\/(\d+)/);
+        var m = String(href).match(/(?:https?:\/\/(?:www\.)?(?:x|twitter)\.com)?\/([A-Za-z0-9_]+)\/status\/(\d+)/);
         if (!m) return null;
         return {
           id: m[2],
@@ -31,13 +31,23 @@ enum AgentDOM {
           url: 'https://x.com/' + m[1] + '/status/' + m[2]
         };
       }
-      function pickStatus(article, quoteRoot) {
-        var scope = quoteRoot || article;
-        var links = scope.querySelectorAll('a[href*="/status/"]');
+      /** Profile handle from relative or absolute x.com href (not /status, not /i/). */
+      function handleFromHref(href) {
+        if (!href) return null;
+        var m = String(href).match(/^(?:https?:\/\/(?:www\.)?(?:x|twitter)\.com)?\/([A-Za-z0-9_]+)\/?(?:\?.*)?$/i);
+        if (!m) return null;
+        var h = m[1];
+        if (/^(i|home|explore|search|notifications|messages|settings|compose|intent|share|hashtag)$/i.test(h)) {
+          return null;
+        }
+        return h;
+      }
+      function pickStatus(scope) {
+        if (!scope) return null;
+        var links = scope.querySelectorAll('a[href*="/status/"], [href*="/status/"]');
         var fallback = null;
         for (var j = 0; j < links.length; j++) {
           var href = links[j].getAttribute('href') || '';
-          // Skip analytics-only / media deep-links when a clean status exists.
           if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) {
             if (!fallback) fallback = statusFromHref(href);
             continue;
@@ -46,6 +56,124 @@ enum AgentDOM {
           if (st) return st;
         }
         return fallback;
+      }
+      /**
+       * Nested quote card root: div[role=link] with User-Name + (tweetText|time),
+       * not wrapping another article.
+       */
+      function findQuoteRoot(article) {
+        var roleLinks = article.querySelectorAll('div[role="link"]');
+        for (var i = 0; i < roleLinks.length; i++) {
+          var el = roleLinks[i];
+          if (!el.querySelector('[data-testid="User-Name"]')) continue;
+          if (!el.querySelector('[data-testid="tweetText"]') && !el.querySelector('time')) continue;
+          if (el.querySelector('article[data-testid="tweet"]')) continue;
+          return el;
+        }
+        return null;
+      }
+      function isInside(node, root) {
+        if (!node || !root) return false;
+        if (root.contains) return root.contains(node);
+        var p = node;
+        while (p) {
+          if (p === root) return true;
+          p = p.parentElement;
+        }
+        return false;
+      }
+      /**
+       * Collect /status/ URLs from React fiber/props. Quote cards are often
+       * div[role=link] with no <a href>; the destination lives in props.
+       */
+      function statusCandidatesFromReact(el) {
+        var out = [];
+        var seenIds = {};
+        if (!el) return out;
+        var seen = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+        function add(href) {
+          var st = statusFromHref(href);
+          if (!st || seenIds[st.id]) return;
+          seenIds[st.id] = true;
+          out.push(st);
+        }
+        function walk(node, depth) {
+          if (!node || depth > 18 || out.length > 12) return;
+          if (typeof node === 'string') { add(node); return; }
+          if (typeof node !== 'object') return;
+          if (node.nodeType) return; // skip DOM nodes
+          if (seen) {
+            try { if (seen.has(node)) return; seen.add(node); } catch (e) { return; }
+          }
+          try {
+            if (typeof node.href === 'string') add(node.href);
+          } catch (e) {}
+          try {
+            for (var k in node) {
+              if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
+              if (k === 'stateNode' || k === '_owner' || k === 'containerInfo') continue;
+              try { walk(node[k], depth + 1); } catch (e) {}
+            }
+          } catch (e) {}
+        }
+        var propKeys = Object.keys(el);
+        for (var i = 0; i < propKeys.length; i++) {
+          var key = propKeys[i];
+          if (key.indexOf('__reactFiber') !== 0 &&
+              key.indexOf('__reactProps') !== 0 &&
+              key.indexOf('__reactInternalInstance') !== 0) continue;
+          try { walk(el[key], 0); } catch (e) {}
+        }
+        return out;
+      }
+      /** Recover quote status id/url when the card has no clean status <a>. */
+      function recoverQuoteStatus(quoteRoot, article, primaryId, quoteHandle) {
+        var st = pickStatus(quoteRoot);
+        if (st) return st;
+        var time = quoteRoot.querySelector('time');
+        if (time) {
+          var a = time.closest && time.closest('a[href]');
+          if (a) {
+            st = statusFromHref(a.getAttribute('href'));
+            if (st) return st;
+          }
+          var p = time.parentElement;
+          while (p && p !== quoteRoot) {
+            if (p.tagName === 'A') {
+              st = statusFromHref(p.getAttribute('href'));
+              if (st) return st;
+            }
+            p = p.parentElement;
+          }
+        }
+        var cands = statusCandidatesFromReact(quoteRoot);
+        // Also scan a couple of parents — props sometimes live one level up.
+        var par = quoteRoot.parentElement;
+        for (var d = 0; d < 2 && par && par !== article; d++) {
+          var more = statusCandidatesFromReact(par);
+          for (var m = 0; m < more.length; m++) cands.push(more[m]);
+          par = par.parentElement;
+        }
+        var preferred = null;
+        var fallback = null;
+        for (var c = 0; c < cands.length; c++) {
+          var cand = cands[c];
+          if (primaryId && cand.id === primaryId) continue;
+          if (!fallback) fallback = cand;
+          if (quoteHandle && cand.handle &&
+              cand.handle.toLowerCase() === String(quoteHandle).toLowerCase()) {
+            preferred = cand;
+            break;
+          }
+        }
+        st = preferred || fallback;
+        if (st) return st;
+        var attrs = quoteRoot.attributes || [];
+        for (var i = 0; i < attrs.length; i++) {
+          st = statusFromHref(attrs[i].value);
+          if (st) return st;
+        }
+        return null;
       }
       function parseUserBlock(userName) {
         var author = null;
@@ -57,13 +185,10 @@ enum AgentDOM {
         var hm = raw.match(/@([A-Za-z0-9_]+)/);
         if (hm) handle = hm[1];
         if (!handle) {
-          var userLinks = userName.querySelectorAll('a[href^="/"]');
+          var userLinks = userName.querySelectorAll('a[href]');
           for (var k = 0; k < userLinks.length; k++) {
-            var uh = userLinks[k].getAttribute('href') || '';
-            if (/^\/[A-Za-z0-9_]+\/?$/.test(uh) && uh.indexOf('/status/') < 0) {
-              handle = uh.replace(/^\//, '').replace(/\/$/, '');
-              break;
-            }
+            var uh = handleFromHref(userLinks[k].getAttribute('href') || '');
+            if (uh) { handle = uh; break; }
           }
         }
         return { author: author, handle: handle };
@@ -83,6 +208,7 @@ enum AgentDOM {
       /**
        * Retweet socialContext: locale-independent via retweet SVG path near
        * socialContext; name/handle from the context node when present.
+       * Handle comes from socialContext (or nearby) link href — absolute or relative.
        */
       function detectRetweetedBy(article) {
         var social = article.querySelector('[data-testid="socialContext"]');
@@ -93,7 +219,6 @@ enum AgentDOM {
           var paths = row.querySelectorAll ? row.querySelectorAll('svg path') : [];
           for (var p = 0; p < paths.length; p++) {
             var dd = paths[p].getAttribute('d') || '';
-            // Canonical X retweet/repost arrow path prefix (stable across locales).
             if (dd.indexOf('M4.75 3.79') === 0 || dd.indexOf('M4.5 3.88') === 0) {
               hasRtIcon = true;
               break;
@@ -103,7 +228,6 @@ enum AgentDOM {
           row = row.parentElement;
         }
         var socialRaw = visibleText(social);
-        // Fallback wording when SVG churns: EN/PL/DE/ES/FR/PT/JA common RT phrases.
         var wordingRt = /retweeted|reposted|poda[łl](a)? dalej|hat retweetet|ha retwitteado|a retweeté|retweetou|リツイート/i.test(socialRaw);
         if (!hasRtIcon && !wordingRt) return null;
         var name = null;
@@ -112,20 +236,38 @@ enum AgentDOM {
           social.querySelector('span[dir="ltr"]');
         if (nameSpan) name = visibleText(nameSpan);
         if (!name) {
-          // "X retweeted" / "User X reposted" — take first non-empty token run.
           var cleaned = socialRaw
             .replace(/^(Użytkownik|User)\s+/i, '')
             .replace(/\s+(poda[łl]a?\s+dalej|retweeted|reposted|hat retweetet|ha retwitteado|a retweeté|retweetou).*$/i, '')
             .trim();
           if (cleaned) name = cleaned;
         }
-        var link = social.querySelector('a[href^="/"]');
-        if (link) {
-          var lh = link.getAttribute('href') || '';
-          if (/^\/[A-Za-z0-9_]+\/?$/.test(lh)) {
-            handle = lh.replace(/^\//, '').replace(/\/$/, '');
+        function takeHandleFrom(root) {
+          if (!root) return null;
+          // socialContext is often a bare <span>; the profile <a> wraps it.
+          if (root.tagName === 'A') {
+            var selfH = handleFromHref(root.getAttribute('href') || '');
+            if (selfH) return { handle: selfH, link: root };
           }
-          if (!name) name = visibleText(link) || null;
+          var links = root.querySelectorAll('a[href]');
+          for (var i = 0; i < links.length; i++) {
+            var h = handleFromHref(links[i].getAttribute('href') || '');
+            if (h) return { handle: h, link: links[i] };
+          }
+          return null;
+        }
+        var hit = takeHandleFrom(social);
+        if (!hit) {
+          var anc = social.parentElement;
+          for (var ad = 0; ad < 6 && anc; ad++) {
+            hit = takeHandleFrom(anc);
+            if (hit) break;
+            anc = anc.parentElement;
+          }
+        }
+        if (hit) {
+          handle = hit.handle;
+          if (!name) name = visibleText(hit.link) || null;
         }
         if (!name && !handle) return null;
         var out = {};
@@ -134,18 +276,8 @@ enum AgentDOM {
         return out;
       }
       /** Quote tweet card: nested div[role=link] with its own User-Name + text. */
-      function detectQuoted(article) {
-        var quoteRoot = null;
-        var roleLinks = article.querySelectorAll('div[role="link"]');
-        for (var i = 0; i < roleLinks.length; i++) {
-          var el = roleLinks[i];
-          if (!el.querySelector('[data-testid="User-Name"]')) continue;
-          if (!el.querySelector('[data-testid="tweetText"]') && !el.querySelector('time')) continue;
-          // Must be nested (not the whole article chrome).
-          if (el.querySelector('article[data-testid="tweet"]')) continue;
-          quoteRoot = el;
-          break;
-        }
+      function detectQuoted(article, primaryId) {
+        var quoteRoot = findQuoteRoot(article);
         if (!quoteRoot) return null;
         var userName = quoteRoot.querySelector('[data-testid="User-Name"]');
         var parsed = parseUserBlock(userName);
@@ -158,8 +290,7 @@ enum AgentDOM {
         }
         var textEl = quoteRoot.querySelector('[data-testid="tweetText"]');
         var qText = textEl ? visibleText(textEl) : '';
-        var st = pickStatus(article, quoteRoot);
-        // Quote blocks often omit status <a>; leave id/url null rather than invent.
+        var st = recoverQuoteStatus(quoteRoot, article, primaryId, parsed.handle);
         var q = {
           handle: parsed.handle || (st && st.handle) || null,
           id: st ? st.id : null,
@@ -177,14 +308,12 @@ enum AgentDOM {
           seen[type] = true;
           media.push({ type: type });
         }
-        // Only count media on the primary card, not inside the quote nest when
-        // we can exclude it — still list media if the outer tweet is media-only.
         var nodes = article.querySelectorAll(
           '[data-testid="tweetPhoto"],[data-testid="videoComponent"],[data-testid="videoPlayer"],[data-testid="card.wrapper"]'
         );
         for (var i = 0; i < nodes.length; i++) {
           var node = nodes[i];
-          if (quoteRoot && quoteRoot.contains(node)) continue;
+          if (quoteRoot && isInside(node, quoteRoot)) continue;
           var tid = node.getAttribute('data-testid') || '';
           if (tid === 'tweetPhoto') add('photo');
           else if (tid === 'videoComponent' || tid === 'videoPlayer') add('video');
@@ -196,64 +325,53 @@ enum AgentDOM {
       var articles = document.querySelectorAll('article[data-testid="tweet"]');
       for (var i = 0; i < articles.length; i++) {
         var article = articles[i];
-        var st = pickStatus(article, null);
+        var quoteRoot = findQuoteRoot(article);
+        var st = pickStatus(article);
+        // Prefer primary status not inside the quote nest.
+        if (quoteRoot) {
+          var links = article.querySelectorAll('a[href*="/status/"]');
+          var primarySt = null;
+          var fallback = null;
+          for (var j = 0; j < links.length; j++) {
+            if (isInside(links[j], quoteRoot)) continue;
+            var href = links[j].getAttribute('href') || '';
+            if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) {
+              if (!fallback) fallback = statusFromHref(href);
+              continue;
+            }
+            var pst = statusFromHref(href);
+            if (pst) { primarySt = pst; break; }
+          }
+          st = primarySt || fallback || st;
+        }
         var id = st ? st.id : null;
         var url = st ? st.url : null;
-        // Primary author is the first User-Name NOT inside a quote role=link.
         var author = null;
         var handle = null;
         var userNames = article.querySelectorAll('[data-testid="User-Name"]');
         var primaryUser = null;
         for (var u = 0; u < userNames.length; u++) {
-          var cand = userNames[u];
-          var inQuote = false;
-          var par = cand.parentElement;
-          while (par && par !== article) {
-            if (par.getAttribute && par.getAttribute('role') === 'link' &&
-                par.querySelector && par.querySelector('[data-testid="tweetText"]')) {
-              inQuote = true;
-              break;
-            }
-            par = par.parentElement;
-          }
-          if (!inQuote) { primaryUser = cand; break; }
+          if (quoteRoot && isInside(userNames[u], quoteRoot)) continue;
+          primaryUser = userNames[u];
+          break;
         }
         if (!primaryUser && userNames.length) primaryUser = userNames[0];
         var parsedUser = parseUserBlock(primaryUser);
         author = parsedUser.author;
         handle = parsedUser.handle;
-        // Primary tweet text: first tweetText not inside quote role=link.
         var text = '';
         var textEls = article.querySelectorAll('[data-testid="tweetText"]');
         for (var t = 0; t < textEls.length; t++) {
-          var te = textEls[t];
-          var inQ = false;
-          var p2 = te.parentElement;
-          while (p2 && p2 !== article) {
-            if (p2.getAttribute && p2.getAttribute('role') === 'link' &&
-                p2.querySelector && p2.querySelector('[data-testid="User-Name"]')) {
-              inQ = true;
-              break;
-            }
-            p2 = p2.parentElement;
-          }
-          if (!inQ) { text = visibleText(te); break; }
+          if (quoteRoot && isInside(textEls[t], quoteRoot)) continue;
+          text = visibleText(textEls[t]);
+          break;
         }
         var timeEl = null;
         var times = article.querySelectorAll('time');
         for (var ti = 0; ti < times.length; ti++) {
-          var tm = times[ti];
-          var inQT = false;
-          var p3 = tm.parentElement;
-          while (p3 && p3 !== article) {
-            if (p3.getAttribute && p3.getAttribute('role') === 'link' &&
-                p3.querySelector && p3.querySelector('[data-testid="User-Name"]')) {
-              inQT = true;
-              break;
-            }
-            p3 = p3.parentElement;
-          }
-          if (!inQT) { timeEl = tm; break; }
+          if (quoteRoot && isInside(times[ti], quoteRoot)) continue;
+          timeEl = times[ti];
+          break;
         }
         var time = null;
         if (timeEl) {
@@ -261,17 +379,8 @@ enum AgentDOM {
         }
         var isAd = detectAd(article);
         var retweetedBy = detectRetweetedBy(article);
-        var quoted = detectQuoted(article);
-        var media = detectMedia(article, null);
-        // Re-run media excluding quote nest so outer media-only cards stay accurate.
-        if (quoted) {
-          var qRoot = null;
-          var rls = article.querySelectorAll('div[role="link"]');
-          for (var ri = 0; ri < rls.length; ri++) {
-            if (rls[ri].querySelector('[data-testid="User-Name"]')) { qRoot = rls[ri]; break; }
-          }
-          media = detectMedia(article, qRoot);
-        }
+        var quoted = detectQuoted(article, id);
+        var media = detectMedia(article, quoteRoot);
         var card = {
           id: id,
           author: author,

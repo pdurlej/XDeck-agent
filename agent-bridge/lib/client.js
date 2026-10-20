@@ -88,13 +88,20 @@ export async function listColumns() {
 
 /**
  * Structured column read: tweet cards + optional raw innerText.
+ * Raw text is opt-in (`includeText` default **false**).
  * @param {number} column
- * @param {{ maxChars?: number, includeText?: boolean }} [opts]
+ * @param {{ maxChars?: number, includeText?: boolean, limit?: number }} [opts]
  */
-export async function readColumn(column, { maxChars, includeText = true } = {}) {
-  const path = includeText
+export async function readColumn(
+  column,
+  { maxChars, includeText = false, limit } = {}
+) {
+  const base = includeText
     ? `/columns/${column}/text`
     : `/columns/${column}/tweets`;
+  const qs = new URLSearchParams();
+  if (typeof limit === "number" && limit > 0) qs.set("limit", String(limit));
+  const path = qs.size ? `${base}?${qs}` : base;
   const data = await bridgeFetch(path);
   if (
     typeof maxChars === "number" &&

@@ -39,7 +39,7 @@ node /absolute/path/to/XDeck-agent/agent-bridge/mcp-server.js
 |------|--------|
 | `health` | Bridge up? Includes aggregate + per-column `needs_human` / `challenge` |
 | `list_columns` | Column metadata |
-| `read_column` | Tweet cards + optional raw text; `needs_human` on login/CAPTCHA/error shell |
+| `read_column` | Tweet cards + optional raw text (`include_text` default **false**); optional `limit`; `needs_human` on login/CAPTCHA/error shell |
 | `navigate_column` | Load URL in column |
 | `scroll_column` | Scroll timeline |
 | `reload_column` | Reload WebView |

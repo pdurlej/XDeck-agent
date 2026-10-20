@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 import Security
@@ -67,13 +68,20 @@ final class AgentBridge {
             Self.writeStatus("token minted path=\(tokenPath?.path ?? "?")")
         }
 
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        // Prefer loopback. Avoid requiredLocalEndpoint — it often fails to
-        // reach .ready under App Sandbox even with network.server.
-        parameters.requiredInterfaceType = .loopback
-
-        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        // Bind explicitly to 127.0.0.1. Do NOT pass `on:` when using
+        // requiredLocalEndpoint (that combo historically never reached .ready
+        // under App Sandbox). Fall back to interfaceType=.loopback if needed.
+        let listener: NWListener
+        let bindMode: String
+        do {
+            listener = try Self.makeLoopbackListener(port: port)
+            bindMode = "requiredLocalEndpoint:127.0.0.1"
+        } catch {
+            print("[AgentBridge] explicit 127.0.0.1 bind failed (\(error)); falling back to requiredInterfaceType=.loopback")
+            Self.writeStatus("explicit loopback bind failed: \(error); fallback interfaceType")
+            listener = try Self.makeInterfaceLoopbackListener(port: port)
+            bindMode = "requiredInterfaceType=.loopback"
+        }
         listener.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
                 self?.accept(connection)
@@ -82,8 +90,8 @@ final class AgentBridge {
         listener.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                print("[AgentBridge] listening on 127.0.0.1:\(port)")
-                Self.writeStatus("listening on 127.0.0.1:\(port)")
+                print("[AgentBridge] listening on 127.0.0.1:\(port) (\(bindMode))")
+                Self.writeStatus("listening on 127.0.0.1:\(port) mode=\(bindMode)")
             case .failed(let error):
                 print("[AgentBridge] listener failed: \(error)")
                 Self.writeStatus("listener failed: \(error)")
@@ -100,8 +108,25 @@ final class AgentBridge {
         listener.start(queue: .main)
         self.listener = listener
         isRunning = true
-        print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused))")
-        Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused)")
+        print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused)) bind=\(bindMode)")
+        Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused) bind=\(bindMode)")
+    }
+
+    /// Explicit IPv4 loopback via `requiredLocalEndpoint` (no `on:` port).
+    private static func makeLoopbackListener(port: UInt16) throws -> NWListener {
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let nwPort = NWEndpoint.Port(rawValue: port)!
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: nwPort)
+        return try NWListener(using: parameters)
+    }
+
+    /// Fallback: prefer loopback interface (may show as `*:port` in lsof).
+    private static func makeInterfaceLoopbackListener(port: UInt16) throws -> NWListener {
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredInterfaceType = .loopback
+        return try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
     }
 
     func stop() {
@@ -358,12 +383,14 @@ final class AgentBridge {
         }
         let method = String(parts[0]).uppercased()
         let pathAndQuery = String(parts[1])
-        let path = pathAndQuery.split(separator: "?", maxSplits: 1).first.map(String.init) ?? pathAndQuery
+        let pathParts = pathAndQuery.split(separator: "?", maxSplits: 1).map(String.init)
+        let path = pathParts.first ?? pathAndQuery
+        let query = pathParts.count > 1 ? Self.parseQuery(pathParts[1]) : [:]
         let headers = Self.parseHeaders(headerText)
 
         do {
             try authorize(headers: headers)
-            let (status, json) = try await route(method: method, path: path, body: body)
+            let (status, json) = try await route(method: method, path: path, query: query, body: body)
             respond(connection, status: status, body: json)
         } catch let error as AgentBridgeError {
             let payload = #"{"error":\#(Self.jsonString(error.localizedDescription))}"#
@@ -381,12 +408,25 @@ final class AgentBridge {
         }
         let provided = String(auth.dropFirst("bearer ".count))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard provided == token, !token.isEmpty else {
+        guard !token.isEmpty, Self.constantTimeEqual(provided, token) else {
             throw AgentBridgeError.unauthorized
         }
     }
 
-    private func route(method: String, path: String, body: Data) async throws -> (Int, String) {
+    /// Constant-time UTF-8 compare (Darwin `timingsafe_bcmp`). Length mismatch → false.
+    private static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        guard aBytes.count == bBytes.count, !aBytes.isEmpty else { return false }
+        return aBytes.withUnsafeBufferPointer { aBuf in
+            bBytes.withUnsafeBufferPointer { bBuf in
+                timingsafe_bcmp(aBuf.baseAddress, bBuf.baseAddress, aBytes.count) == 0
+            }
+        }
+    }
+
+    private func route(method: String, path: String, query: [String: String], body: Data) async throws -> (Int, String) {
+        let limit = Self.parseLimit(query["limit"])
         switch (method, path) {
         case ("GET", "/health"):
             return (200, try await healthJSON())
@@ -394,10 +434,10 @@ final class AgentBridge {
             return (200, columnsJSON())
         case ("GET", _) where path.hasPrefix("/columns/") && path.hasSuffix("/text"):
             let index = try parseColumnIndex(path: path, suffix: "/text")
-            return (200, try await readColumnJSON(index: index, includeText: true))
+            return (200, try await readColumnJSON(index: index, includeText: true, limit: limit))
         case ("GET", _) where path.hasPrefix("/columns/") && path.hasSuffix("/tweets"):
             let index = try parseColumnIndex(path: path, suffix: "/tweets")
-            return (200, try await readColumnJSON(index: index, includeText: false))
+            return (200, try await readColumnJSON(index: index, includeText: false, limit: limit))
         case ("POST", "/eval"):
             try requireEvalEnabled()
             return try await handleEval(body: body, defaultColumn: nil)
@@ -431,15 +471,26 @@ final class AgentBridge {
         }
     }
 
-    private func readColumnJSON(index: Int, includeText: Bool) async throws -> String {
+    private func readColumnJSON(index: Int, includeText: Bool, limit: Int?) async throws -> String {
         let challengeJSON = try await ColumnRegistry.shared.evaluateJavaScript(
             column: index,
             script: AgentDOM.challengeProbeJS
         )
-        let tweetsJSON = try await ColumnRegistry.shared.evaluateJavaScript(
+        var tweetsJSON = try await ColumnRegistry.shared.evaluateJavaScript(
             column: index,
             script: AgentDOM.extractTweetsJS
         )
+        if let limit, limit > 0,
+           let data = tweetsJSON.data(using: .utf8),
+           var arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+            if arr.count > limit {
+                arr = Array(arr.prefix(limit))
+                if let truncated = try? JSONSerialization.data(withJSONObject: arr),
+                   let s = String(data: truncated, encoding: .utf8) {
+                    tweetsJSON = s
+                }
+            }
+        }
         var parts = [
             #""column":\#(index)"#,
             #""challenge":\#(challengeJSON)"#,
@@ -463,6 +514,24 @@ final class AgentBridge {
             parts.append(#""text":\#(textJSON)"#)
         }
         return "{\(parts.joined(separator: ","))}"
+    }
+
+    private static func parseQuery(_ raw: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for pair in raw.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1).map(String.init)
+            guard let key = kv.first, !key.isEmpty else { continue }
+            let value = kv.count > 1
+                ? (kv[1].removingPercentEncoding ?? kv[1])
+                : ""
+            out[key.lowercased()] = value
+        }
+        return out
+    }
+
+    private static func parseLimit(_ raw: String?) -> Int? {
+        guard let raw, let n = Int(raw), n > 0 else { return nil }
+        return min(n, 500)
     }
 
     private static func needsHuman(fromChallengeJSON json: String) -> Bool? {
