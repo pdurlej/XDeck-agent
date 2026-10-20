@@ -404,7 +404,12 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "\"XDeck/Preview Content\"";
 				DEVELOPMENT_TEAM = "";
-				ENABLE_HARDENED_RUNTIME = NO;
+				/* Ad-hoc Debug: keep hardened ON in project settings (Xcode may
+				   strip the runtime flag for identity "-"; that is OK). Do NOT
+				   force --options runtime on nested debug dylibs — mismatched
+				   Team IDs → dyld abort / Polish "Nie można otworzyć XDeck". */
+				ENABLE_DEBUG_DYLIB = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";

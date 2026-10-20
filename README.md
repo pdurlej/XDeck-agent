@@ -44,13 +44,27 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 ```sh
 git clone https://github.com/pdurlej/XDeck-agent.git
 cd XDeck-agent
-# Debug is ad-hoc by default (no DEVELOPMENT_TEAM / CODE_SIGN_IDENTITY=-):
-xcodebuild -scheme XDeck -configuration Debug build
-# Or open XDeck.xcodeproj — Scheme XDeck → Debug (shared scheme sets XDECK_AGENT=1)
-# Keep bundle id me.morishin.XDeck to reuse WebKit login. Release still uses the project team.
+# Debug is ad-hoc by default (CODE_SIGN_IDENTITY=-, empty DEVELOPMENT_TEAM):
+# plain xcodebuild — no Apple Development cert required.
+xcodebuild -scheme XDeck -configuration Debug \
+  -derivedDataPath "$PWD/.derivedData" build
+# Launch the *DerivedData product* (not a copy under /tmp):
+open -n --env XDECK_AGENT=1 \
+  "$PWD/.derivedData/Build/Products/Debug/XDeck.app"
+# Or Xcode → Scheme XDeck → Debug (shared scheme sets XDECK_AGENT=1).
+# Keep bundle id me.morishin.XDeck to reuse WebKit login.
 ```
 
-Debug uses `XDeck/XDeck.Debug.entitlements` (`network.server` + home-relative App Support exception) and **ad-hoc** signing so `xcodebuild` works without a local cert. Release uses `XDeck/XDeck.entitlements` (**no** server) + team signing.
+**Launch protocol**
+
+1. Prefer **`open` on the DerivedData product** — not `/tmp/XDeck-*.app`. Copies under `/tmp` plus LaunchAgent/`LSOpen` can hit sandbox_extension / error **-54** (“Nie można otworzyć XDeck”) even when ad-hoc signing is fine.
+2. **Never overwrite** notarized `/Applications/XDeck.app` with an ad-hoc Debug build.
+3. When **swapping builds**: start the new app → verify `GET /health` → only then stop the old process. On failure, keep/restore the old bridge (do not kill first).
+4. Optional with a personal team:  
+   `xcodebuild … CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=<yourTeam> CODE_SIGN_IDENTITY=`  
+   (clears forced `-`). Hardened runtime then applies for real; with ad-hoc, Xcode may strip the runtime flag at codesign time — that is OK.
+
+Debug uses `XDeck/XDeck.Debug.entitlements` (`network.server` + App Support / `/Users/Shared/XDeck-agent` exceptions), **ad-hoc** signing, `ENABLE_HARDENED_RUNTIME=YES`, and `ENABLE_DEBUG_DYLIB=NO`. Release uses `XDeck/XDeck.entitlements` (**no** server) + team signing.
 
 ### curl smoke
 
