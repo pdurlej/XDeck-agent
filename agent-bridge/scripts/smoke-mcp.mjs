@@ -75,7 +75,6 @@ async function main() {
     if (listed.error) throw new Error(JSON.stringify(listed.error));
     const names = (listed.result?.tools || []).map((t) => t.name).sort();
     const expected = [
-      "eval_js",
       "health",
       "list_columns",
       "navigate_column",
@@ -87,6 +86,20 @@ async function main() {
       if (!names.includes(name)) {
         throw new Error(`missing tool ${name}; got ${names.join(", ")}`);
       }
+    }
+    // eval_js is opt-in (XDECK_AGENT_EVAL=1); must be absent by default.
+    const evalOptIn = ["1", "true", "yes"].includes(
+      String(process.env.XDECK_AGENT_EVAL || "")
+        .trim()
+        .toLowerCase()
+    );
+    if (!evalOptIn && names.includes("eval_js")) {
+      throw new Error(
+        "eval_js must be absent from tools/list unless XDECK_AGENT_EVAL=1"
+      );
+    }
+    if (evalOptIn && !names.includes("eval_js")) {
+      throw new Error("eval_js missing despite XDECK_AGENT_EVAL opt-in");
     }
 
     const healthCall = await request("tools/call", {

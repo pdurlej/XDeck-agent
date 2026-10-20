@@ -7,6 +7,7 @@
  *  2. Topic search — navigate_column to search URL, ready, tweets ≥1 OR documented SPA fail
  *  3. Periodic poll — 2–3 read_column cycles with stable ids / diff; no crash
  *  4. Write honesty — post/reply/retweet return HTTP 501 (do NOT actually post)
+ *  5. Eval gate — MCP tools/list omits eval_js by default; HTTP POST /eval → 404
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -14,10 +15,13 @@
  *   node evals/scenarios.mjs --column 0 --query openrig --polls 3
  *
  * Env: XDECK_AGENT_URL, XDECK_AGENT_TOKEN, XDECK_AGENT_TOKEN_FILE (same as CLI)
+ *      XDECK_AGENT_EVAL must be unset for scenario 5 (default).
  */
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import readline from "node:readline";
 import {
   health,
   readColumn,
@@ -435,6 +439,136 @@ async function scenario4WriteHonesty() {
   );
 }
 
+/** MCP tools/list via short-lived stdio server (inherits env minus EVAL). */
+async function listMcpTools(env) {
+  const serverPath = path.resolve(__dirname, "../mcp-server.js");
+  const child = spawn(process.execPath, [serverPath], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env,
+    cwd: path.resolve(__dirname, ".."),
+  });
+  const rl = readline.createInterface({ input: child.stdout });
+  const pending = new Map();
+  let nextId = 1;
+  let stderr = "";
+  child.stderr.on("data", (d) => {
+    stderr += d.toString("utf8");
+  });
+  rl.on("line", (line) => {
+    if (!line.trim()) return;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (msg.id != null && pending.has(msg.id)) {
+      pending.get(msg.id)(msg);
+      pending.delete(msg.id);
+    }
+  });
+  function request(method, params) {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`timeout waiting for ${method}`));
+      }, 12000);
+      pending.set(id, (response) => {
+        clearTimeout(timer);
+        resolve(response);
+      });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+  }
+  try {
+    const init = await request("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "xdeck-evals", version: "0.2.0" },
+    });
+    if (init.error) throw new Error(JSON.stringify(init.error));
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`
+    );
+    const listed = await request("tools/list", {});
+    if (listed.error) throw new Error(JSON.stringify(listed.error));
+    const names = (listed.result?.tools || []).map((t) => t.name).sort();
+    return { names, stderr };
+  } finally {
+    try {
+      child.stdin.end();
+    } catch {
+      /* ignore */
+    }
+    child.kill("SIGTERM");
+  }
+}
+
+async function scenario5EvalGate() {
+  const evalEnv = String(process.env.XDECK_AGENT_EVAL || "")
+    .trim()
+    .toLowerCase();
+  const evalOptIn = ["1", "true", "yes"].includes(evalEnv);
+
+  // Always spawn MCP without EVAL to assert default surface.
+  const mcpEnv = { ...process.env };
+  delete mcpEnv.XDECK_AGENT_EVAL;
+  let mcp;
+  try {
+    mcp = await listMcpTools(mcpEnv);
+  } catch (err) {
+    return grade(false, false, `MCP tools/list failed: ${err.message || err}`, {
+      error: String(err.message || err),
+    });
+  }
+  const evalAbsent = !mcp.names.includes("eval_js");
+
+  const httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
+  const httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
+  // Bridge returns 404 when XDECK_AGENT_EVAL unset (documented).
+  const http404 =
+    httpEval.status === 404 && httpColEval.status === 404;
+
+  if (evalOptIn) {
+    // Suite still passes MCP default check; HTTP may be 200 if app also has EVAL.
+    const pass = evalAbsent;
+    return grade(
+      pass,
+      false,
+      pass
+        ? `MCP default omits eval_js; note: harness env has XDECK_AGENT_EVAL=${evalEnv} (HTTP may be enabled on app)`
+        : "eval_js present in default MCP tools/list",
+      {
+        mcpTools: mcp.names,
+        evalAbsent,
+        httpEval: { status: httpEval.status, body: httpEval.body },
+        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+        harnessEvalOptIn: true,
+      }
+    );
+  }
+
+  const pass = evalAbsent && http404;
+  const partial = evalAbsent && !http404;
+  return grade(
+    pass,
+    partial,
+    pass
+      ? "eval_js absent from tools/list; POST /eval and /columns/0/eval return 404"
+      : partial
+        ? `MCP omits eval_js but HTTP eval not 404 (got ${httpEval.status}/${httpColEval.status}) — rebuild app without XDECK_AGENT_EVAL`
+        : `eval gate failed: mcpHasEval=${!evalAbsent} http=${httpEval.status}/${httpColEval.status}`,
+    {
+      mcpTools: mcp.names,
+      evalAbsent,
+      httpEval: { status: httpEval.status, body: httpEval.body },
+      httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      harnessEvalOptIn: false,
+    }
+  );
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
@@ -502,12 +636,19 @@ async function main() {
   };
   console.error(`  4 write_honesty: ${report.scenarios[4].status} — ${report.scenarios[4].reason}`);
 
+  report.scenarios[5] = {
+    name: "eval_js_gated",
+    ...(await scenario5EvalGate()),
+  };
+  console.error(`  5 eval_js_gated: ${report.scenarios[5].status} — ${report.scenarios[5].reason}`);
+
   report.finishedAt = new Date().toISOString();
   report.summary = {
     1: report.scenarios[1].status,
     2: report.scenarios[2].status,
     3: report.scenarios[3].status,
     4: report.scenarios[4].status,
+    5: report.scenarios[5].status,
   };
 
   const out = JSON.stringify(report, null, 2);

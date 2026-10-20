@@ -4,73 +4,287 @@ import Foundation
 /// Prefer these over ad-hoc agent CSS — x.com `data-testid` still churns.
 enum AgentDOM {
     /// Parse visible tweet cards in the column WebView.
+    /// Emits isAd, retweetedBy, quoted, media when present. Status URLs are
+    /// normalized (never `/analytics`). Ad detection is locale-independent
+    /// (cell impression pixels — same signal as hideAds).
     static let extractTweetsJS = #"""
     (function() {
+      function visibleText(el) {
+        if (!el) return '';
+        return (document.visibilityState === 'hidden'
+          ? (el.textContent || '')
+          : (el.innerText || el.textContent || '')).trim();
+      }
       function absUrl(href) {
         if (!href) return null;
         if (href.indexOf('http') === 0) return href.split('?')[0];
         return 'https://x.com' + href.split('?')[0];
       }
+      /** Prefer /status/<id>; strip /analytics|/photo|/video|/likes suffixes. */
+      function statusFromHref(href) {
+        if (!href) return null;
+        var m = String(href).match(/\/([A-Za-z0-9_]+)\/status\/(\d+)/);
+        if (!m) return null;
+        return {
+          id: m[2],
+          handle: m[1],
+          url: 'https://x.com/' + m[1] + '/status/' + m[2]
+        };
+      }
+      function pickStatus(article, quoteRoot) {
+        var scope = quoteRoot || article;
+        var links = scope.querySelectorAll('a[href*="/status/"]');
+        var fallback = null;
+        for (var j = 0; j < links.length; j++) {
+          var href = links[j].getAttribute('href') || '';
+          // Skip analytics-only / media deep-links when a clean status exists.
+          if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) {
+            if (!fallback) fallback = statusFromHref(href);
+            continue;
+          }
+          var st = statusFromHref(href);
+          if (st) return st;
+        }
+        return fallback;
+      }
+      function parseUserBlock(userName) {
+        var author = null;
+        var handle = null;
+        if (!userName) return { author: author, handle: handle };
+        var raw = visibleText(userName);
+        var lines = raw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
+        if (lines.length) author = lines[0];
+        var hm = raw.match(/@([A-Za-z0-9_]+)/);
+        if (hm) handle = hm[1];
+        if (!handle) {
+          var userLinks = userName.querySelectorAll('a[href^="/"]');
+          for (var k = 0; k < userLinks.length; k++) {
+            var uh = userLinks[k].getAttribute('href') || '';
+            if (/^\/[A-Za-z0-9_]+\/?$/.test(uh) && uh.indexOf('/status/') < 0) {
+              handle = uh.replace(/^\//, '').replace(/\/$/, '');
+              break;
+            }
+          }
+        }
+        return { author: author, handle: handle };
+      }
+      /**
+       * Locale-independent ad flag. Same signal as hideAds: cells with
+       * *-impression-pixel (placementTracking alone also wraps some organic
+       * video tweets — do NOT use that alone).
+       */
+      function detectAd(article) {
+        var cell = article.closest('[data-testid="cellInnerDiv"]') ||
+          article.closest('[data-testid="placementTracking"]') ||
+          article.parentElement;
+        if (!cell) return false;
+        return !!cell.querySelector('[data-testid$="-impression-pixel"]');
+      }
+      /**
+       * Retweet socialContext: locale-independent via retweet SVG path near
+       * socialContext; name/handle from the context node when present.
+       */
+      function detectRetweetedBy(article) {
+        var social = article.querySelector('[data-testid="socialContext"]');
+        if (!social) return null;
+        var row = social;
+        var hasRtIcon = false;
+        for (var d = 0; d < 6 && row; d++) {
+          var paths = row.querySelectorAll ? row.querySelectorAll('svg path') : [];
+          for (var p = 0; p < paths.length; p++) {
+            var dd = paths[p].getAttribute('d') || '';
+            // Canonical X retweet/repost arrow path prefix (stable across locales).
+            if (dd.indexOf('M4.75 3.79') === 0 || dd.indexOf('M4.5 3.88') === 0) {
+              hasRtIcon = true;
+              break;
+            }
+          }
+          if (hasRtIcon) break;
+          row = row.parentElement;
+        }
+        var socialRaw = visibleText(social);
+        // Fallback wording when SVG churns: EN/PL/DE/ES/FR/PT/JA common RT phrases.
+        var wordingRt = /retweeted|reposted|poda[łl](a)? dalej|hat retweetet|ha retwitteado|a retweeté|retweetou|リツイート/i.test(socialRaw);
+        if (!hasRtIcon && !wordingRt) return null;
+        var name = null;
+        var handle = null;
+        var nameSpan = social.querySelector('span[dir="ltr"] span') ||
+          social.querySelector('span[dir="ltr"]');
+        if (nameSpan) name = visibleText(nameSpan);
+        if (!name) {
+          // "X retweeted" / "User X reposted" — take first non-empty token run.
+          var cleaned = socialRaw
+            .replace(/^(Użytkownik|User)\s+/i, '')
+            .replace(/\s+(poda[łl]a?\s+dalej|retweeted|reposted|hat retweetet|ha retwitteado|a retweeté|retweetou).*$/i, '')
+            .trim();
+          if (cleaned) name = cleaned;
+        }
+        var link = social.querySelector('a[href^="/"]');
+        if (link) {
+          var lh = link.getAttribute('href') || '';
+          if (/^\/[A-Za-z0-9_]+\/?$/.test(lh)) {
+            handle = lh.replace(/^\//, '').replace(/\/$/, '');
+          }
+          if (!name) name = visibleText(link) || null;
+        }
+        if (!name && !handle) return null;
+        var out = {};
+        if (name) out.name = name;
+        if (handle) out.handle = handle;
+        return out;
+      }
+      /** Quote tweet card: nested div[role=link] with its own User-Name + text. */
+      function detectQuoted(article) {
+        var quoteRoot = null;
+        var roleLinks = article.querySelectorAll('div[role="link"]');
+        for (var i = 0; i < roleLinks.length; i++) {
+          var el = roleLinks[i];
+          if (!el.querySelector('[data-testid="User-Name"]')) continue;
+          if (!el.querySelector('[data-testid="tweetText"]') && !el.querySelector('time')) continue;
+          // Must be nested (not the whole article chrome).
+          if (el.querySelector('article[data-testid="tweet"]')) continue;
+          quoteRoot = el;
+          break;
+        }
+        if (!quoteRoot) return null;
+        var userName = quoteRoot.querySelector('[data-testid="User-Name"]');
+        var parsed = parseUserBlock(userName);
+        if (!parsed.handle) {
+          var av = quoteRoot.querySelector('[data-testid^="UserAvatar-Container-"]');
+          if (av) {
+            var am = (av.getAttribute('data-testid') || '').match(/^UserAvatar-Container-(.+)$/);
+            if (am) parsed.handle = am[1];
+          }
+        }
+        var textEl = quoteRoot.querySelector('[data-testid="tweetText"]');
+        var qText = textEl ? visibleText(textEl) : '';
+        var st = pickStatus(article, quoteRoot);
+        // Quote blocks often omit status <a>; leave id/url null rather than invent.
+        var q = {
+          handle: parsed.handle || (st && st.handle) || null,
+          id: st ? st.id : null,
+          url: st ? st.url : null,
+          text: qText
+        };
+        if (!q.handle && !q.text && !q.id) return null;
+        return q;
+      }
+      function detectMedia(article, quoteRoot) {
+        var media = [];
+        var seen = {};
+        function add(type) {
+          if (seen[type]) return;
+          seen[type] = true;
+          media.push({ type: type });
+        }
+        // Only count media on the primary card, not inside the quote nest when
+        // we can exclude it — still list media if the outer tweet is media-only.
+        var nodes = article.querySelectorAll(
+          '[data-testid="tweetPhoto"],[data-testid="videoComponent"],[data-testid="videoPlayer"],[data-testid="card.wrapper"]'
+        );
+        for (var i = 0; i < nodes.length; i++) {
+          var node = nodes[i];
+          if (quoteRoot && quoteRoot.contains(node)) continue;
+          var tid = node.getAttribute('data-testid') || '';
+          if (tid === 'tweetPhoto') add('photo');
+          else if (tid === 'videoComponent' || tid === 'videoPlayer') add('video');
+          else if (tid === 'card.wrapper') add('card');
+        }
+        return media;
+      }
       var tweets = [];
       var articles = document.querySelectorAll('article[data-testid="tweet"]');
       for (var i = 0; i < articles.length; i++) {
         var article = articles[i];
-        var id = null;
-        var url = null;
-        var links = article.querySelectorAll('a[href*="/status/"]');
-        for (var j = 0; j < links.length; j++) {
-          var href = links[j].getAttribute('href') || '';
-          var m = href.match(/\/status\/(\d+)/);
-          if (m) {
-            id = m[1];
-            url = absUrl(href);
-            break;
-          }
-        }
+        var st = pickStatus(article, null);
+        var id = st ? st.id : null;
+        var url = st ? st.url : null;
+        // Primary author is the first User-Name NOT inside a quote role=link.
         var author = null;
         var handle = null;
-        var userName = article.querySelector('[data-testid="User-Name"]');
-        if (userName) {
-          var raw = ((document.visibilityState === 'hidden'
-            ? userName.textContent
-            : userName.innerText) || userName.textContent || '').trim();
-          var lines = raw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
-          if (lines.length) author = lines[0];
-          var hm = raw.match(/@([A-Za-z0-9_]+)/);
-          if (hm) handle = hm[1];
-          if (!handle) {
-            var userLinks = userName.querySelectorAll('a[href^="/"]');
-            for (var k = 0; k < userLinks.length; k++) {
-              var uh = userLinks[k].getAttribute('href') || '';
-              if (/^\/[A-Za-z0-9_]+\/?$/.test(uh) && uh.indexOf('/status/') < 0) {
-                handle = uh.replace(/^\//, '').replace(/\/$/, '');
-                break;
-              }
+        var userNames = article.querySelectorAll('[data-testid="User-Name"]');
+        var primaryUser = null;
+        for (var u = 0; u < userNames.length; u++) {
+          var cand = userNames[u];
+          var inQuote = false;
+          var par = cand.parentElement;
+          while (par && par !== article) {
+            if (par.getAttribute && par.getAttribute('role') === 'link' &&
+                par.querySelector && par.querySelector('[data-testid="tweetText"]')) {
+              inQuote = true;
+              break;
             }
+            par = par.parentElement;
           }
+          if (!inQuote) { primaryUser = cand; break; }
         }
-        var textEl = article.querySelector('[data-testid="tweetText"]');
-        // Prefer textContent when the column WebView is visibility:hidden
-        // (off-screen columns): innerText is then empty by CSS rules.
+        if (!primaryUser && userNames.length) primaryUser = userNames[0];
+        var parsedUser = parseUserBlock(primaryUser);
+        author = parsedUser.author;
+        handle = parsedUser.handle;
+        // Primary tweet text: first tweetText not inside quote role=link.
         var text = '';
-        if (textEl) {
-          text = (document.visibilityState === 'hidden'
-            ? (textEl.textContent || '')
-            : (textEl.innerText || textEl.textContent || '')).trim();
+        var textEls = article.querySelectorAll('[data-testid="tweetText"]');
+        for (var t = 0; t < textEls.length; t++) {
+          var te = textEls[t];
+          var inQ = false;
+          var p2 = te.parentElement;
+          while (p2 && p2 !== article) {
+            if (p2.getAttribute && p2.getAttribute('role') === 'link' &&
+                p2.querySelector && p2.querySelector('[data-testid="User-Name"]')) {
+              inQ = true;
+              break;
+            }
+            p2 = p2.parentElement;
+          }
+          if (!inQ) { text = visibleText(te); break; }
         }
-        var timeEl = article.querySelector('time');
+        var timeEl = null;
+        var times = article.querySelectorAll('time');
+        for (var ti = 0; ti < times.length; ti++) {
+          var tm = times[ti];
+          var inQT = false;
+          var p3 = tm.parentElement;
+          while (p3 && p3 !== article) {
+            if (p3.getAttribute && p3.getAttribute('role') === 'link' &&
+                p3.querySelector && p3.querySelector('[data-testid="User-Name"]')) {
+              inQT = true;
+              break;
+            }
+            p3 = p3.parentElement;
+          }
+          if (!inQT) { timeEl = tm; break; }
+        }
         var time = null;
         if (timeEl) {
           time = timeEl.getAttribute('datetime') || (timeEl.textContent || null);
         }
-        tweets.push({
+        var isAd = detectAd(article);
+        var retweetedBy = detectRetweetedBy(article);
+        var quoted = detectQuoted(article);
+        var media = detectMedia(article, null);
+        // Re-run media excluding quote nest so outer media-only cards stay accurate.
+        if (quoted) {
+          var qRoot = null;
+          var rls = article.querySelectorAll('div[role="link"]');
+          for (var ri = 0; ri < rls.length; ri++) {
+            if (rls[ri].querySelector('[data-testid="User-Name"]')) { qRoot = rls[ri]; break; }
+          }
+          media = detectMedia(article, qRoot);
+        }
+        var card = {
           id: id,
           author: author,
           handle: handle,
           text: text,
           time: time,
           url: url
-        });
+        };
+        if (isAd) card.isAd = true;
+        if (retweetedBy) card.retweetedBy = retweetedBy;
+        if (quoted) card.quoted = quoted;
+        if (media.length) card.media = media;
+        tweets.push(card);
       }
       return tweets;
     })()
