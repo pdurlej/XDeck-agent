@@ -231,6 +231,15 @@ struct ContentView: View {
                     let dynamicColumnWidth = baseWidth * CGFloat(pageZoom)
 
                     ZStack {
+                        // Agent-only WKWebViews: behind the human deck, near-invisible,
+                        // same default data store / login. Not shown as deck columns.
+                        if AgentBridge.isEnabledByEnvironment,
+                           !AgentColumnLeases.shared.agentIndices.isEmpty {
+                            AgentColumnsHost()
+                                .frame(width: geometry.size.width, height: geometry.size.height)
+                                .zIndex(-1)
+                        }
+
                         // Update zoom buttons to change only the zoom factor.
                         Button("+") {
                             pageZoom += 0.2

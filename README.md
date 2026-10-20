@@ -34,10 +34,13 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 |--------------|------|
 | `health` / `list_columns` | Session + column metadata; `health` includes per-column `needs_human` / `challenge` |
 | `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`, optional `metrics` / `article` / `inReplyTo` / `isPinned` / `isAd` / …) + `needs_human` on login/CAPTCHA/error shell. On `/notifications` also returns typed `notifications[]`. Raw `innerText` is **opt-in** (`include_text`); optional `limit` caps card count |
-| `navigate_column` | SPA-safe navigate (pushState / search-box); waits for search **and status** tweets / retries error shells; logs when navigate > ~10s |
-| `scroll_column` | Scroll timeline viewport |
+| `acquire_column` / `release_column` | Lease **agent-only** hidden columns (default indices **100–101**, `type=agent`, `visible=false`, same cookie jar; `visibilityState` stays `visible`) |
+| `navigate_column` | SPA-safe navigate (pushState / search-box). **User columns → 403** unless `XDECK_AGENT_ALLOW_USER_NAV=1`; agent columns need matching `agentId` + min nav interval (default 5s) |
+| `scroll_column` | Scroll timeline viewport (same user-column / lease rules as navigate) |
 | `reload_column` | Reload WebView |
 | `eval_js` | **Opt-in only** (`XDECK_AGENT_EVAL=1` on MCP **and** the XDeck app). Absent from `tools/list` by default; HTTP `POST /eval` → **404** when unset. Powerful — can mutate the SPA |
+
+Agent columns are not shown in the human deck (near-invisible WKWebViews behind content). Prefer `acquire_column` → navigate/scroll with `agent_id` so Piotr’s columns 0–3 stay put.
 
 `read_column` tweet cards may include `isAd`, `retweetedBy`, `quoted`, `media`, `metrics` (`replies`/`reposts`/`likes`/`views`/`bookmarks`), `article` (`title`/`preview`), `inReplyTo`, `isPinned` when present. Status `url` is normalized (never `/analytics`). Notifications columns add `notifications: [{type, actors, actorCount, target?, time?}]`.
 

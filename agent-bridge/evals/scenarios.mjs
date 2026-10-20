@@ -18,6 +18,9 @@
  * 12. Bind restart — (opt-in) kill XDeck, relaunch within 5s; unauth /health → 401 within 15s
  * 13. Eval remains gated — after hasWebView ready, POST /eval → 404 body contains "Eval disabled"
  * 14. N4 status not-found — nonexistent status fails fast (notFound, waitedMs ≪ 54s, retries 0)
+ * 15. Agent columns — list/health type=agent visible:false; concurrent leases; user nav 403
+ *
+ * Navigate/scroll prefer agent columns (acquire_column) so Piotr's deck stays put.
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -41,9 +44,32 @@ import {
   navigateColumn,
   scrollColumn,
   reloadColumn,
+  acquireColumn,
+  releaseColumn,
   readToken,
   DEFAULT_BASE,
 } from "../lib/client.js";
+
+/**
+ * Prefer agent-only columns for navigate/scroll so Piotr's visible deck stays put.
+ * Falls back to the requested user column only when acquire fails (old builds).
+ */
+async function withAgentNav(agentId, preferredColumn, fn) {
+  const acq = await timed(() => acquireColumn(agentId, { ttl: 180 }));
+  if (acq.ok && typeof acq.value?.column === "number") {
+    const column = acq.value.column;
+    try {
+      return await fn(column, agentId, { usedAgent: true, acquire: acq.value });
+    } finally {
+      await releaseColumn({ agentId }).catch(() => {});
+    }
+  }
+  // Legacy bridge without agent columns — try user column (may 403 on new builds).
+  return fn(preferredColumn, undefined, {
+    usedAgent: false,
+    acquireError: acq.error,
+  });
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -301,11 +327,15 @@ async function scenario1FeedBrowse(column) {
 
 async function scenario2TopicSearch(column, query) {
   const url = `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query&f=live`;
-  const nav = await timed(() => navigateColumn(column, url));
+  return withAgentNav("eval-scenario2", column, async (navColumn, agentId, meta) => {
+  const nav = await timed(() =>
+    navigateColumn(navColumn, url, agentId ? { agentId } : {})
+  );
   if (!nav.ok) {
     return grade(false, false, `navigate_column failed: ${nav.error}`, {
       url,
       navigate: nav,
+      meta,
     });
   }
   const n = nav.value;
@@ -313,7 +343,7 @@ async function scenario2TopicSearch(column, query) {
   const ready = n.ready === true || n.ok === true;
   const navTweetCount = typeof n.tweetCount === "number" ? n.tweetCount : null;
 
-  const read = await timed(() => readColumn(column, { includeText: false }));
+  const read = await timed(() => readColumn(navColumn, { includeText: false }));
   const tweetCount = read.ok
     ? read.value.tweetCount ??
       (Array.isArray(read.value.tweets) ? read.value.tweets.length : 0)
@@ -338,12 +368,14 @@ async function scenario2TopicSearch(column, query) {
     pass,
     partial,
     pass
-      ? `navigate ok method=${n.method ?? "?"} tweets=${tweetCount} (navCount=${navTweetCount})`
+      ? `navigate ok column=${navColumn} method=${n.method ?? "?"} tweets=${tweetCount} (navCount=${navTweetCount})`
       : partial
         ? `SPA/empty documented: errorShell=${errorShell} method=${n.method ?? "?"} ready=${n.ready} tweets=${tweetCount}`
         : `topic search failed: ok=${n.ok} errorShell=${errorShell} tweets=${tweetCount} readErr=${read.error || null}`,
     {
       url,
+      navColumn,
+      meta,
       navigateMs: nav.ms,
       readMs: read.ok ? read.ms : null,
       navigate: {
@@ -360,6 +392,7 @@ async function scenario2TopicSearch(column, query) {
       needs_human: read.ok ? read.value.needs_human : null,
     }
   );
+  });
 }
 
 /** After reload/scroll, wait briefly for SPA cards (agents should do the same). */
@@ -934,13 +967,18 @@ async function scenario7Metrics(column) {
 }
 
 async function scenario8Notifications(column) {
+  return withAgentNav("eval-scenario8", column, async (navColumn, agentId, meta) => {
   const nav = await timed(() =>
-    navigateColumn(column, "https://x.com/notifications")
+    navigateColumn(
+      navColumn,
+      "https://x.com/notifications",
+      agentId ? { agentId } : {}
+    )
   );
   await sleep(2000);
-  const read = await timed(() => readColumn(column, { includeText: false }));
+  const read = await timed(() => readColumn(navColumn, { includeText: false }));
   if (!read.ok) {
-    return grade(false, false, `read_column failed: ${read.error}`, { nav, read });
+    return grade(false, false, `read_column failed: ${read.error}`, { nav, read, meta });
   }
   const events = Array.isArray(read.value.notifications)
     ? read.value.notifications
@@ -1075,17 +1113,23 @@ async function scenario8Notifications(column) {
       hydrating: read.value.hydrating ?? null,
       stale: read.value.stale ?? null,
       sample: events ? events.slice(0, 5) : null,
+      meta,
     }
   );
+  });
 }
 
 /** N4: nonexistent status must fail fast (not 2×16s retries ≈ 54s). */
 async function scenario14StatusNotFound(column) {
   const fakeId = "1999999999999999999";
+  // Neutral public handle (hygiene) + agent-column lease for navigate.
   const url = `https://x.com/example/status/${fakeId}`;
-  const nav = await timed(() => navigateColumn(column, url));
+  return withAgentNav("eval-scenario14", column, async (navColumn, agentId, meta) => {
+  const nav = await timed(() =>
+    navigateColumn(navColumn, url, agentId ? { agentId } : {})
+  );
   if (!nav.ok) {
-    return grade(false, false, `navigate failed: ${nav.error}`, { nav });
+    return grade(false, false, `navigate failed: ${nav.error}`, { nav, meta });
   }
   const v = nav.value || {};
   const waitedMs = typeof v.waitedMs === "number" ? v.waitedMs : nav.ms;
@@ -1102,12 +1146,14 @@ async function scenario14StatusNotFound(column) {
     pass,
     partial,
     pass
-      ? `status not-found fail-fast waitedMs=${waitedMs} retries=${retries}`
+      ? `status not-found fail-fast waitedMs=${waitedMs} retries=${retries} column=${navColumn}`
       : partial
         ? `partial not-found waitedMs=${waitedMs} notFound=${notFound} retries=${retries}`
         : `slow/missing not-found waitedMs=${waitedMs} notFound=${notFound} retries=${retries}`,
     {
       url,
+      navColumn,
+      meta,
       ok: v.ok,
       ready: v.ready,
       notFound,
@@ -1116,8 +1162,10 @@ async function scenario14StatusNotFound(column) {
       tweetCount: v.tweetCount,
       method: v.method,
       navMs: nav.ms,
+      noRetryBurn,
     }
   );
+  });
 }
 
 /** Scroll/wait a status conversation like a real agent until replies or ads appear. */
@@ -1611,6 +1659,62 @@ async function scenario13EvalRemainsGated() {
   return grade(false, false, httpGate.reason, httpGate.evidence);
 }
 
+/**
+ * Agent-only columns: shape + concurrent leases + user-column navigate → 403.
+ * Heavy search/scroll/expiry covered by `evals/agent-columns.mjs`.
+ */
+async function scenario15AgentColumns() {
+  const h = await timed(() => health());
+  if (!h.ok) {
+    return grade(false, false, `health failed: ${h.error}`, { h });
+  }
+  const agents = (h.value.columns || []).filter((c) => c.type === "agent");
+  if (agents.length < 1) {
+    return grade(
+      false,
+      true,
+      "no agent columns in /health (rebuild Debug XDeck with agent hidden columns)",
+      { health: h.value }
+    );
+  }
+  const shapeOk =
+    agents.every((c) => c.visible === false && c.index >= 100) &&
+    agents.every(
+      (c) =>
+        c.visibilityState === "visible" || c.visibilityState === '"visible"'
+    );
+
+  const a = await timed(() => acquireColumn("eval-s15-a", { ttl: 45 }));
+  const b = await timed(() => acquireColumn("eval-s15-b", { ttl: 45 }));
+  const different =
+    a.ok && b.ok && a.value.column !== b.value.column && a.value.column >= 100;
+  await releaseColumn({ agentId: "eval-s15-a" }).catch(() => {});
+  await releaseColumn({ agentId: "eval-s15-b" }).catch(() => {});
+
+  const nav0 = await rawPost("/navigate", {
+    column: 0,
+    url: "https://x.com/explore",
+  });
+  const forbidden = nav0.status === 403;
+
+  const pass = shapeOk && different && forbidden;
+  const partial = !pass && (shapeOk || different || forbidden);
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `agent columns ok (${agents.length}); concurrent ${a.value?.column}/${b.value?.column}; user nav 403`
+      : `shapeOk=${shapeOk} different=${different} forbidden403=${forbidden}`,
+    {
+      agents,
+      acquireA: a,
+      acquireB: b,
+      navigate0: nav0,
+      agentColumnCount: h.value.agentColumnCount,
+    }
+  );
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
@@ -1660,11 +1764,12 @@ async function main() {
   };
   console.error(`  2 topic_search: ${report.scenarios[2].status} — ${report.scenarios[2].reason}`);
 
-  // After topic search, try to return home for cleaner poll (best-effort)
+  // After topic search, leave user columns alone (agent nav was released).
+  // Best-effort home only if ALLOW_USER_NAV is on — otherwise 403 is expected.
   await timed(() =>
     navigateColumn(opts.column, "https://x.com/home")
   ).catch(() => {});
-  await sleep(1000);
+  await sleep(500);
 
   report.scenarios[3] = {
     name: "periodic_poll",
@@ -1734,8 +1839,15 @@ async function main() {
     `  14 n4_status_not_found: ${report.scenarios[14].status} — ${report.scenarios[14].reason}`
   );
 
-  // Leave column on home for the next human/agent session (best-effort).
-  await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
+  report.scenarios[15] = {
+    name: "agent_hidden_columns",
+    ...(await scenario15AgentColumns()),
+  };
+  console.error(
+    `  15 agent_hidden_columns: ${report.scenarios[15].status} — ${report.scenarios[15].reason}`
+  );
+
+  // Do not navigate user columns home — protects Piotr's deck (403 without opt-in).
 
   // Must run last: never leave HTTP eval enabled on the shared bridge.
   report.scenarios[13] = {
@@ -1762,6 +1874,7 @@ async function main() {
     12: report.scenarios[12].status,
     13: report.scenarios[13].status,
     14: report.scenarios[14].status,
+    15: report.scenarios[15].status,
   };
 
   const out = JSON.stringify(report, null, 2);

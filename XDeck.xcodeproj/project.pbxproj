@@ -10,6 +10,8 @@
 		A9F6000120A9F6A100000001 /* ColumnRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000020A9F6A100000001 /* ColumnRegistry.swift */; };
 		A9F6000320A9F6A100000002 /* AgentBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000220A9F6A100000002 /* AgentBridge.swift */; };
 		A9F6000620A9F6A100000005 /* AgentDOM.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000520A9F6A100000005 /* AgentDOM.swift */; };
+		A9F6000820A9F6A100000007 /* AgentColumnLeases.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000720A9F6A100000007 /* AgentColumnLeases.swift */; };
+		A9F6000A20A9F6A100000009 /* AgentColumnsHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000920A9F6A100000009 /* AgentColumnsHost.swift */; };
 		5B0DC3542A8FC79400268684 /* WebViewConfigurations.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B0DC3532A8FC79400268684 /* WebViewConfigurations.swift */; };
 		5B1CC26B2A95026F00DF7D83 /* GitHubIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B1CC26A2A95026F00DF7D83 /* GitHubIcon.swift */; };
 		5B1CC26F2A95944A00DF7D83 /* AppearanceToggle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B1CC26E2A95944A00DF7D83 /* AppearanceToggle.swift */; };
@@ -37,6 +39,8 @@
 		A9F6000220A9F6A100000002 /* AgentBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentBridge.swift; sourceTree = "<group>"; };
 		A9F6000420A9F6A100000003 /* XDeck.Debug.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = XDeck.Debug.entitlements; sourceTree = "<group>"; };
 		A9F6000520A9F6A100000005 /* AgentDOM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDOM.swift; sourceTree = "<group>"; };
+		A9F6000720A9F6A100000007 /* AgentColumnLeases.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentColumnLeases.swift; sourceTree = "<group>"; };
+		A9F6000920A9F6A100000009 /* AgentColumnsHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentColumnsHost.swift; sourceTree = "<group>"; };
 		5B0DC3532A8FC79400268684 /* WebViewConfigurations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewConfigurations.swift; sourceTree = "<group>"; };
 		5B1CC26A2A95026F00DF7D83 /* GitHubIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubIcon.swift; sourceTree = "<group>"; };
 		5B1CC26E2A95944A00DF7D83 /* AppearanceToggle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceToggle.swift; sourceTree = "<group>"; };
@@ -78,6 +82,7 @@
 				A9F6000020A9F6A100000001 /* ColumnRegistry.swift */,
 				A9F6000220A9F6A100000002 /* AgentBridge.swift */,
 				A9F6000520A9F6A100000005 /* AgentDOM.swift */,
+				A9F6000720A9F6A100000007 /* AgentColumnLeases.swift */,
 			);
 			path = Agent;
 			sourceTree = "<group>";
@@ -87,6 +92,7 @@
 			children = (
 				5B66C9672AE7FBF400D51830 /* Icon */,
 				5B90B8C42A8E6D7300185EAA /* ContentView.swift */,
+				A9F6000920A9F6A100000009 /* AgentColumnsHost.swift */,
 				5BC7F4802C17EA42002A37C2 /* UpdateButton.swift */,
 				5B1CC26E2A95944A00DF7D83 /* AppearanceToggle.swift */,
 				5BD50E842C14BBFE004D4A7E /* HideAdsToggle.swift */,
@@ -251,6 +257,8 @@
 				A9F6000120A9F6A100000001 /* ColumnRegistry.swift in Sources */,
 				A9F6000320A9F6A100000002 /* AgentBridge.swift in Sources */,
 				A9F6000620A9F6A100000005 /* AgentDOM.swift in Sources */,
+				A9F6000820A9F6A100000007 /* AgentColumnLeases.swift in Sources */,
+				A9F6000A20A9F6A100000009 /* AgentColumnsHost.swift in Sources */,
 				5B1CC2732A95969600DF7D83 /* MoonIcon.swift in Sources */,
 				5B4A3FE22C17646F00043FC1 /* GitHubSponsorIcon.swift in Sources */,
 				5BC7F4812C17EA42002A37C2 /* UpdateButton.swift in Sources */,

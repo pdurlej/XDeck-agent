@@ -20,13 +20,16 @@ struct WebView: NSViewRepresentable {
     /// When set, this WebView registers itself with `ColumnRegistry` for the agent bridge.
     var columnIndex: Int? = nil
     var columnType: String? = nil
+    /// Human deck columns are visible; agent-only columns are not shown in the UI.
+    var columnVisible: Bool = true
 
     func makeNSView(context: Context) -> WKWebView {
         let webView: WKWebView
         if let configuration = configuration {
-            webView = WKWebView(frame: .zero, configuration: configuration)
+            // Prefer caller-provided store (agent columns force `.default()`).
+            webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 700), configuration: configuration)
         } else {
-            webView = WKWebView()
+            webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
         }
         // Pretend Safari because 𝕏 bans the user agent of WebView
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
@@ -42,7 +45,8 @@ struct WebView: NSViewRepresentable {
                     type: columnType,
                     webView: webView,
                     url: url,
-                    isLoading: true
+                    isLoading: true,
+                    visible: columnVisible
                 )
             }
         }

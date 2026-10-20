@@ -12,6 +12,8 @@ final class ColumnRegistry {
         let url: String?
         let isLoading: Bool
         let hasWebView: Bool
+        /// False for agent-only hidden columns (not shown in the human deck).
+        let visible: Bool
         /// N3: mid-load / waiting for first cards.
         let hydrating: Bool
         /// N3: past grace, still empty after one self-heal reload (or heal exhausted).
@@ -23,6 +25,7 @@ final class ColumnRegistry {
         weak var webView: WKWebView?
         var url: URL?
         var isLoading: Bool
+        var visible: Bool
         /// When the latest navigation finished (`isLoading` → false).
         var loadFinishedAt: Date?
         /// True after one automatic reload for blank post-load columns.
@@ -75,13 +78,21 @@ final class ColumnRegistry {
         ignoreBindingLoad.insert(ObjectIdentifier(webView))
     }
 
-    func register(index: Int, type: String, webView: WKWebView, url: URL?, isLoading: Bool) {
+    func register(
+        index: Int,
+        type: String,
+        webView: WKWebView,
+        url: URL?,
+        isLoading: Bool,
+        visible: Bool = true
+    ) {
         entries[index]?.hydrateTask?.cancel()
         entries[index] = Entry(
             type: type,
             webView: webView,
             url: url,
             isLoading: isLoading,
+            visible: visible,
             loadFinishedAt: isLoading ? nil : Date(),
             hydrateHealAttempted: false,
             lastCardCount: 0,
@@ -131,6 +142,7 @@ final class ColumnRegistry {
                 url: entry.url?.absoluteString,
                 isLoading: entry.isLoading,
                 hasWebView: entry.webView != nil,
+                visible: entry.visible,
                 hydrating: flags.hydrating,
                 stale: flags.stale
             )
@@ -682,6 +694,12 @@ enum AgentBridgeError: LocalizedError {
     case notImplemented(String)
     /// Localhost bind failed (EADDRINUSE or other) — bridge is down; no wildcard fallback.
     case bindFailed(String)
+    /// User-column navigate/scroll refused, or agent lease mismatch.
+    case forbidden(String)
+    /// No free agent column (all leased).
+    case conflict(String)
+    /// Navigation pacing on agent columns.
+    case tooManyRequests(String)
 
     var errorDescription: String? {
         switch self {
@@ -703,14 +721,23 @@ enum AgentBridgeError: LocalizedError {
             return "\(feature) is not implemented. This bridge is a read/navigate lab telescope — no post/reply/like/click tools. Do not use eval_js to mutate the page unless a human explicitly asks."
         case .bindFailed(let message):
             return message
+        case .forbidden(let message):
+            return message
+        case .conflict(let message):
+            return message
+        case .tooManyRequests(let message):
+            return message
         }
     }
 
     var statusCode: Int {
         switch self {
         case .unauthorized: return 401
+        case .forbidden: return 403
         case .columnNotFound, .notFound, .evalDisabled: return 404
         case .badRequest: return 400
+        case .conflict: return 409
+        case .tooManyRequests: return 429
         case .notImplemented: return 501
         case .methodNotAllowed: return 405
         case .jsError, .bindFailed: return 500
