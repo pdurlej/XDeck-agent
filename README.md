@@ -29,13 +29,13 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 | Tool / route | Role |
 |--------------|------|
 | `health` / `list_columns` | Session + column metadata; `health` includes per-column `needs_human` / `challenge` |
-| `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`) + `needs_human` on login/CAPTCHA/error shell. Raw `innerText` is **opt-in** (`include_text`); optional `limit` caps card count |
-| `navigate_column` | SPA-safe navigate (pushState / search-box); waits for search tweets / retries error shells |
+| `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`, optional `metrics` / `article` / `inReplyTo` / `isPinned` / `isAd` / …) + `needs_human` on login/CAPTCHA/error shell. On `/notifications` also returns typed `notifications[]`. Raw `innerText` is **opt-in** (`include_text`); optional `limit` caps card count |
+| `navigate_column` | SPA-safe navigate (pushState / search-box); waits for search **and status** tweets / retries error shells; logs when navigate > ~10s |
 | `scroll_column` | Scroll timeline viewport |
 | `reload_column` | Reload WebView |
 | `eval_js` | **Opt-in only** (`XDECK_AGENT_EVAL=1` on MCP **and** the XDeck app). Absent from `tools/list` by default; HTTP `POST /eval` → **404** when unset. Powerful — can mutate the SPA |
 
-`read_column` tweet cards may include `isAd`, `retweetedBy`, `quoted`, `media` when present. Status `url` is normalized (never `/analytics`).
+`read_column` tweet cards may include `isAd`, `retweetedBy`, `quoted`, `media`, `metrics` (`replies`/`reposts`/`likes`/`views`/`bookmarks`), `article` (`title`/`preview`), `inReplyTo`, `isPinned` when present. Status `url` is normalized (never `/analytics`). Notifications columns add `notifications: [{type, actors, actorCount, target?, time?}]`.
 
 `click` / `type` / `post_tweet` / … return **HTTP 501 Not Implemented** (honest — not “needs confirm”).
 
@@ -81,9 +81,23 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 ## MCP (Cursor · Claude Code · Codex)
 
+**Canonical checkout (this Mac):** keep Claude Code / Cursor / Codex pointed at one clone on **`main`** (or the PR branch under test):
+
+```text
+/Users/pd/Developer/BuildScratch/XDeck-agent-bridge
+```
+
+Entrypoint: `…/XDeck-agent-bridge/agent-bridge/mcp-server.js`  
+Fast-forward when stale (must not stay on old P0 tips that still expose `eval_js` by default):
+
+```sh
+cd /Users/pd/Developer/BuildScratch/XDeck-agent-bridge
+git fetch origin && git checkout main && git pull --ff-only origin main
+cd agent-bridge && npm install && npm run smoke
+```
+
 ```sh
 cd agent-bridge && npm install
-# entrypoint (use YOUR clone path):
 node mcp-server.js
 npm run smoke
 ```
@@ -94,8 +108,10 @@ npm run smoke
 {
   "mcpServers": {
     "xdeck-agent": {
-      "command": "node",
-      "args": ["/absolute/path/to/XDeck-agent/agent-bridge/mcp-server.js"]
+      "command": "/opt/homebrew/bin/node",
+      "args": [
+        "/Users/pd/Developer/BuildScratch/XDeck-agent-bridge/agent-bridge/mcp-server.js"
+      ]
     }
   }
 }
@@ -105,14 +121,16 @@ npm run smoke
 
 ```sh
 claude mcp add -s user xdeck-agent -- \
-  node /absolute/path/to/XDeck-agent/agent-bridge/mcp-server.js
+  /opt/homebrew/bin/node \
+  /Users/pd/Developer/BuildScratch/XDeck-agent-bridge/agent-bridge/mcp-server.js
 ```
 
 ### Codex
 
 ```sh
 codex mcp add xdeck-agent -- \
-  node /absolute/path/to/XDeck-agent/agent-bridge/mcp-server.js
+  /opt/homebrew/bin/node \
+  /Users/pd/Developer/BuildScratch/XDeck-agent-bridge/agent-bridge/mcp-server.js
 ```
 
 Optional env: `XDECK_AGENT_URL`, `XDECK_AGENT_TOKEN`, `XDECK_AGENT_TOKEN_FILE`.

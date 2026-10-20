@@ -4,9 +4,10 @@ import Foundation
 /// Prefer these over ad-hoc agent CSS — x.com `data-testid` still churns.
 enum AgentDOM {
     /// Parse visible tweet cards in the column WebView.
-    /// Emits isAd, retweetedBy, quoted, media when present. Status URLs are
-    /// normalized (never `/analytics`). Ad detection is locale-independent
-    /// (cell impression pixels — same signal as hideAds).
+    /// Emits isAd, retweetedBy, quoted, media, metrics, article, inReplyTo,
+    /// isPinned when present. Status URLs are normalized (never `/analytics`).
+    /// Ad detection: impression pixels + status-page fallbacks (no `<time>` +
+    /// placement / Ad|Promoted|Promowane label).
     static let extractTweetsJS = #"""
     (function() {
       function visibleText(el) {
@@ -19,6 +20,112 @@ enum AgentDOM {
         if (!href) return null;
         if (href.indexOf('http') === 0) return href.split('?')[0];
         return 'https://x.com' + href.split('?')[0];
+      }
+      /**
+       * Locale-independent engagement counts from aria-labels / button text.
+       * Handles 1.2K, 1,2 tys., 3 tys, 1.5M, 2 mln, plain ints with spaces/commas.
+       */
+      function parseCount(raw) {
+        if (raw == null) return null;
+        var s = String(raw).replace(/\u00a0/g, ' ').trim();
+        if (!s) return null;
+        var withUnit = s.match(/([\d]+(?:[.,]\d+)?)\s*(tys\.?|k|mln\.?|m|b)\b/i);
+        if (withUnit) {
+          var n = parseFloat(withUnit[1].replace(',', '.'));
+          if (isNaN(n)) return null;
+          var unit = withUnit[2].toLowerCase().replace(/\./g, '');
+          if (unit === 'tys' || unit === 'k') n *= 1000;
+          else if (unit === 'mln' || unit === 'm') n *= 1e6;
+          else if (unit === 'b') n *= 1e9;
+          return Math.round(n);
+        }
+        var m = s.match(/(\d{1,3}(?:[ \u00a0.,]\d{3})+|\d+)/);
+        if (!m) return null;
+        var cleaned = m[1].replace(/[ \u00a0]/g, '');
+        // 1,234 (US) or 1.234 (EU thousands) → int; keep single decimal aside
+        if (/^\d{1,3}(,\d{3})+$/.test(cleaned)) cleaned = cleaned.replace(/,/g, '');
+        else if (/^\d{1,3}(\.\d{3})+$/.test(cleaned)) cleaned = cleaned.replace(/\./g, '');
+        else cleaned = cleaned.replace(/,/g, '');
+        var n2 = parseInt(cleaned, 10);
+        return isNaN(n2) ? null : n2;
+      }
+      function countFromControl(el) {
+        if (!el) return null;
+        var aria = el.getAttribute('aria-label') || '';
+        var n = parseCount(aria);
+        if (n != null) return n;
+        var spans = el.querySelectorAll('span');
+        for (var i = 0; i < spans.length; i++) {
+          var t = visibleText(spans[i]);
+          if (!t || !/[\d]/.test(t)) continue;
+          if (/reply|repost|retweet|like|bookmark|view|odpowiedz|podaj|polub|zakład|wyświet/i.test(t) &&
+              t.length > 12) continue;
+          n = parseCount(t);
+          if (n != null) return n;
+        }
+        return parseCount(visibleText(el));
+      }
+      function detectMetrics(article) {
+        var metrics = {};
+        function setKey(key, el) {
+          if (!el) return;
+          var n = countFromControl(el);
+          // Control present → always emit a number (0 when aria has no count).
+          metrics[key] = n != null ? n : 0;
+        }
+        setKey('replies', article.querySelector('[data-testid="reply"]'));
+        setKey('reposts', article.querySelector('[data-testid="retweet"]'));
+        setKey('likes', article.querySelector('[data-testid="like"]') ||
+          article.querySelector('[data-testid="unlike"]'));
+        setKey('bookmarks', article.querySelector('[data-testid="bookmark"]') ||
+          article.querySelector('[data-testid="removeBookmark"]'));
+        var analytics = article.querySelector('a[href*="/analytics"]');
+        if (analytics) {
+          var v = countFromControl(analytics);
+          metrics.views = v != null ? v : 0;
+        }
+        if (!('views' in metrics)) {
+          // Some builds put view count on a role=link without /analytics yet.
+          var candidates = article.querySelectorAll('a[aria-label], div[aria-label], span[aria-label]');
+          for (var i = 0; i < candidates.length; i++) {
+            var lab = candidates[i].getAttribute('aria-label') || '';
+            if (!/view|wyświet/i.test(lab)) continue;
+            if (/analytics|post analytics|statystyk/i.test(lab) || /view/i.test(lab)) {
+              var vv = parseCount(lab);
+              if (vv != null) { metrics.views = vv; break; }
+            }
+          }
+        }
+        return Object.keys(metrics).length ? metrics : null;
+      }
+      /** X Article badge only — exact leaf text, prefer near card.wrapper. */
+      function hasArticleLabel(article) {
+        var card = article.querySelector('[data-testid="card.wrapper"]');
+        var scopes = card ? [card] : [];
+        scopes.push(article);
+        for (var s = 0; s < scopes.length; s++) {
+          var scan = scopes[s].querySelectorAll('span, div, a');
+          for (var i = 0; i < scan.length && i < 80; i++) {
+            var el = scan[i];
+            // Prefer leaf-ish nodes (no nested element text duplication)
+            if (el.children && el.children.length > 2) continue;
+            var t = visibleText(el);
+            if (!t) continue;
+            if (/^(Artykuł|Article)$/i.test(t)) return true;
+          }
+          if (card && s === 0) {
+            // Label sometimes sits just above the card
+            var prev = card.parentElement;
+            for (var up = 0; up < 3 && prev; up++) {
+              var sibs = prev.querySelectorAll('span');
+              for (var j = 0; j < sibs.length && j < 20; j++) {
+                if (/^(Artykuł|Article)$/i.test(visibleText(sibs[j]))) return true;
+              }
+              prev = prev.parentElement;
+            }
+          }
+        }
+        return false;
       }
       /** Prefer /status/<id>; strip /analytics|/photo|/video|/likes suffixes. */
       function statusFromHref(href) {
@@ -194,16 +301,119 @@ enum AgentDOM {
         return { author: author, handle: handle };
       }
       /**
-       * Locale-independent ad flag. Same signal as hideAds: cells with
-       * *-impression-pixel (placementTracking alone also wraps some organic
-       * video tweets — do NOT use that alone).
+       * Locale-independent ad flag. Primary: *-impression-pixel (same as hideAds).
+       * Fallback for status/conversation pages where impression pixels miss
+       * promoted cards: no <time> + placementTracking, or Ad/Promoted label.
        */
       function detectAd(article) {
         var cell = article.closest('[data-testid="cellInnerDiv"]') ||
           article.closest('[data-testid="placementTracking"]') ||
           article.parentElement;
+        if (cell && cell.querySelector('[data-testid$="-impression-pixel"]')) return true;
+        var hasTime = !!article.querySelector('time');
+        var hasPlacement = !!(article.closest('[data-testid="placementTracking"]') ||
+          (cell && cell.querySelector('[data-testid="placementTracking"]')));
+        if (!hasTime && hasPlacement) return true;
+        var labelNodes = article.querySelectorAll('span, div, [dir="ltr"]');
+        for (var i = 0; i < labelNodes.length && i < 40; i++) {
+          var t = visibleText(labelNodes[i]);
+          if (!t || t.length > 24) continue;
+          if (/^(Ad|Ads|Promoted|Promowane|Reklama|Sponsored)$/i.test(t)) return true;
+        }
+        if (cell) {
+          var near = cell.querySelectorAll('span');
+          for (var j = 0; j < near.length && j < 30; j++) {
+            var nt = visibleText(near[j]);
+            if (/^(Ad|Ads|Promoted|Promowane|Reklama|Sponsored)$/i.test(nt)) return true;
+          }
+        }
+        return false;
+      }
+      /** Reply context: "Replying to @x" / "W odpowiedzi do @x". */
+      function detectInReplyTo(article) {
+        var handles = [];
+        var seen = {};
+        function add(h) {
+          if (!h || seen[h.toLowerCase()]) return;
+          seen[h.toLowerCase()] = true;
+          handles.push(h);
+        }
+        var nodes = article.querySelectorAll('div, span, a');
+        for (var i = 0; i < nodes.length && i < 80; i++) {
+          var t = visibleText(nodes[i]);
+          if (!t || t.length > 120) continue;
+          if (!/(?:Replying to|W odpowiedzi do)/i.test(t)) continue;
+          var re = /@([A-Za-z0-9_]+)/g;
+          var m;
+          while ((m = re.exec(t))) add(m[1]);
+          var links = nodes[i].querySelectorAll('a[href]');
+          for (var k = 0; k < links.length; k++) {
+            var hh = handleFromHref(links[k].getAttribute('href') || '');
+            if (hh) add(hh);
+          }
+          break;
+        }
+        if (!handles.length) return null;
+        return { handle: handles[0], handles: handles.length > 1 ? handles : undefined };
+      }
+      /** Pinned tweet marker on profile timelines. */
+      function detectPinned(article) {
+        var social = article.querySelector('[data-testid="socialContext"]');
+        if (social && /pinned|przypięt/i.test(visibleText(social))) return true;
+        var cell = article.closest('[data-testid="cellInnerDiv"]') || article.parentElement;
         if (!cell) return false;
-        return !!cell.querySelector('[data-testid$="-impression-pixel"]');
+        var spans = cell.querySelectorAll('span');
+        for (var i = 0; i < spans.length && i < 20; i++) {
+          var t = visibleText(spans[i]);
+          if (/^Pinned(\s+Tweet)?$/i.test(t) || /^Przypięt[yae]/i.test(t)) return true;
+        }
+        return false;
+      }
+      /**
+       * X Articles: long-form cards labeled Article/Artykuł with title/preview
+       * and often empty tweetText.
+       */
+      function detectArticle(article) {
+        var label = hasArticleLabel(article) ? 'Article' : null;
+        var card = article.querySelector('[data-testid="card.wrapper"]') ||
+          article.querySelector('[data-testid="card.layoutLarge.media"]') ||
+          article.querySelector('[data-testid="card.layoutSmall.media"]');
+        // Require Article/Artykuł label — card.wrapper alone is ordinary link cards/ads.
+        if (!label) return null;
+        // Title: prefer large card heading / bold line near Article label
+        var title = null;
+        var preview = null;
+        if (card) {
+          var bits = [];
+          var texts = card.querySelectorAll('[dir="ltr"], span, a');
+          for (var j = 0; j < texts.length; j++) {
+            var ct = visibleText(texts[j]);
+            if (!ct || ct.length < 3) continue;
+            if (/^(Artykuł|Article|From|Od)$/i.test(ct)) continue;
+            if (ct.indexOf('http') === 0) continue;
+            if (bits.indexOf(ct) >= 0) continue;
+            if (ct.length > 8) bits.push(ct);
+            if (bits.length >= 4) break;
+          }
+          if (bits.length) title = bits[0];
+          if (bits.length > 1) preview = bits[1];
+        }
+        if (!title) {
+          // Fallback: longest non-handle line in article when labeled Article
+          var best = '';
+          var scan = article.querySelectorAll('span, div, a');
+          for (var k = 0; k < scan.length && k < 120; k++) {
+            var lt = visibleText(scan[k]);
+            if (!lt || lt.length < 12 || lt.length > 200) continue;
+            if (/^@/.test(lt) || /^(Artykuł|Article)$/i.test(lt)) continue;
+            if (lt.length > best.length) best = lt;
+          }
+          if (best) title = best;
+        }
+        var out = {};
+        if (title) out.title = title;
+        if (preview) out.preview = preview;
+        return Object.keys(out).length ? out : { title: label };
       }
       /**
        * Retweet socialContext: locale-independent via retweet SVG path near
@@ -300,7 +510,7 @@ enum AgentDOM {
         if (!q.handle && !q.text && !q.id) return null;
         return q;
       }
-      function detectMedia(article, quoteRoot) {
+      function detectMedia(article, quoteRoot, hasArticle) {
         var media = [];
         var seen = {};
         function add(type) {
@@ -308,6 +518,7 @@ enum AgentDOM {
           seen[type] = true;
           media.push({ type: type });
         }
+        if (hasArticle) add('article');
         var nodes = article.querySelectorAll(
           '[data-testid="tweetPhoto"],[data-testid="videoComponent"],[data-testid="videoPlayer"],[data-testid="card.wrapper"]'
         );
@@ -317,7 +528,7 @@ enum AgentDOM {
           var tid = node.getAttribute('data-testid') || '';
           if (tid === 'tweetPhoto') add('photo');
           else if (tid === 'videoComponent' || tid === 'videoPlayer') add('video');
-          else if (tid === 'card.wrapper') add('card');
+          else if (tid === 'card.wrapper' && !hasArticle) add('card');
         }
         return media;
       }
@@ -380,7 +591,11 @@ enum AgentDOM {
         var isAd = detectAd(article);
         var retweetedBy = detectRetweetedBy(article);
         var quoted = detectQuoted(article, id);
-        var media = detectMedia(article, quoteRoot);
+        var articleMeta = detectArticle(article);
+        var media = detectMedia(article, quoteRoot, !!articleMeta);
+        var metrics = detectMetrics(article);
+        var inReplyTo = detectInReplyTo(article);
+        var isPinned = detectPinned(article);
         var card = {
           id: id,
           author: author,
@@ -393,9 +608,185 @@ enum AgentDOM {
         if (retweetedBy) card.retweetedBy = retweetedBy;
         if (quoted) card.quoted = quoted;
         if (media.length) card.media = media;
+        if (metrics) card.metrics = metrics;
+        if (articleMeta) card.article = articleMeta;
+        if (inReplyTo) {
+          card.inReplyTo = inReplyTo.handles
+            ? { handle: inReplyTo.handle, handles: inReplyTo.handles }
+            : { handle: inReplyTo.handle };
+        }
+        if (isPinned) card.isPinned = true;
         tweets.push(card);
       }
       return tweets;
+    })()
+    """#
+
+    /// Typed notification events when the column is on `/notifications`.
+    /// Likes/follows/reposts of own posts often lack tweet cards — only chrome text.
+    static let extractNotificationsJS = #"""
+    (function() {
+      var path = String(location.pathname || '');
+      if (!/\/notifications/i.test(path)) return [];
+      function visibleText(el) {
+        if (!el) return '';
+        return (document.visibilityState === 'hidden'
+          ? (el.textContent || '')
+          : (el.innerText || el.textContent || '')).trim();
+      }
+      function statusFromHref(href) {
+        if (!href) return null;
+        var m = String(href).match(/(?:https?:\/\/(?:www\.)?(?:x|twitter)\.com)?\/([A-Za-z0-9_]+)\/status\/(\d+)/);
+        if (!m) return null;
+        return {
+          id: m[2],
+          handle: m[1],
+          url: 'https://x.com/' + m[1] + '/status/' + m[2]
+        };
+      }
+      function handleFromHref(href) {
+        if (!href) return null;
+        var m = String(href).match(/^(?:https?:\/\/(?:www\.)?(?:x|twitter)\.com)?\/([A-Za-z0-9_]+)\/?(?:\?.*)?$/i);
+        if (!m) return null;
+        var h = m[1];
+        if (/^(i|home|explore|search|notifications|messages|settings|compose|intent|share|hashtag)$/i.test(h)) {
+          return null;
+        }
+        return h;
+      }
+      function classifyType(cell, raw) {
+        var lower = (raw || '').toLowerCase();
+        var paths = cell.querySelectorAll('svg path');
+        for (var i = 0; i < paths.length; i++) {
+          var d = paths[i].getAttribute('d') || '';
+          // Heart (like)
+          if (d.indexOf('M20.884') === 0 || d.indexOf('M16.697') === 0 ||
+              d.indexOf('M12 21.638') === 0) return 'like';
+          // Repost arrows
+          if (d.indexOf('M4.75 3.79') === 0 || d.indexOf('M4.5 3.88') === 0) return 'repost';
+          // Person/follow
+          if (d.indexOf('M17.863') === 0 || d.indexOf('M10 4c-1.105') === 0 ||
+              d.indexOf('M12.225') === 0) return 'follow';
+        }
+        if (/liked|polubił|polubiła|polubili|gefällt|aimé|dio like/i.test(lower)) return 'like';
+        if (/reposted|retweeted|poda[łl](a|i)?\s+dalej|hat retweetet|retweeteó/i.test(lower)) return 'repost';
+        if (/followed|obserwuje|obserwują|folgt|suivi|empezó a seguir/i.test(lower)) return 'follow';
+        if (/mention|wspomnia[łl]|mentioned|mencion/i.test(lower)) return 'mention';
+        if (/replied|odpowiedzia[łl]|répond|respondió/i.test(lower)) return 'reply';
+        if (cell.querySelector('article[data-testid="tweet"]') &&
+            /@/.test(lower) && /mention|wspomn|replied|odpowied/i.test(lower)) {
+          return /replied|odpowied/i.test(lower) ? 'reply' : 'mention';
+        }
+        if (cell.querySelector('article[data-testid="tweet"]')) return 'mention';
+        return 'other';
+      }
+      function actorsFrom(cell) {
+        var actors = [];
+        var seen = {};
+        function add(name, handle) {
+          var key = (handle || name || '').toLowerCase();
+          if (!key || seen[key]) return;
+          seen[key] = true;
+          var a = {};
+          if (name) a.name = name;
+          if (handle) a.handle = handle;
+          actors.push(a);
+        }
+        var avatars = cell.querySelectorAll('[data-testid^="UserAvatar-Container-"]');
+        for (var i = 0; i < avatars.length; i++) {
+          var tid = avatars[i].getAttribute('data-testid') || '';
+          var am = tid.match(/^UserAvatar-Container-(.+)$/);
+          if (am && am[1] && am[1] !== 'unknown') add(null, am[1]);
+        }
+        var userNames = cell.querySelectorAll('[data-testid="User-Name"]');
+        for (var u = 0; u < userNames.length; u++) {
+          var raw = visibleText(userNames[u]);
+          var name = raw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean)[0] || null;
+          var hm = raw.match(/@([A-Za-z0-9_]+)/);
+          var handle = hm ? hm[1] : null;
+          if (!handle) {
+            var links = userNames[u].querySelectorAll('a[href]');
+            for (var k = 0; k < links.length; k++) {
+              handle = handleFromHref(links[k].getAttribute('href') || '');
+              if (handle) break;
+            }
+          }
+          add(name, handle);
+        }
+        // Notification header often: "Alice and Bob liked your post"
+        if (!actors.length) {
+          var links2 = cell.querySelectorAll('a[href]');
+          for (var L = 0; L < links2.length; L++) {
+            var h = handleFromHref(links2[L].getAttribute('href') || '');
+            if (h) add(visibleText(links2[L]) || null, h);
+          }
+        }
+        return actors;
+      }
+      function actorCountFrom(raw, actorsLen) {
+        var m = (raw || '').match(/(\d+)\s+(?:others|innych|weitere|autres|otros)/i);
+        if (m) return actorsLen + parseInt(m[1], 10);
+        if (/ and | i | und | et | y /i.test(raw || '') && actorsLen >= 1) {
+          // "A and B" → at least 2
+          return Math.max(actorsLen, 2);
+        }
+        return actorsLen;
+      }
+      function targetFrom(cell) {
+        var article = cell.querySelector('article[data-testid="tweet"]');
+        var scope = article || cell;
+        var links = scope.querySelectorAll('a[href*="/status/"]');
+        var st = null;
+        for (var i = 0; i < links.length; i++) {
+          var href = links[i].getAttribute('href') || '';
+          if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) continue;
+          st = statusFromHref(href);
+          if (st) break;
+        }
+        var text = '';
+        var textEl = scope.querySelector('[data-testid="tweetText"]');
+        if (textEl) text = visibleText(textEl);
+        if (!st && !text) return null;
+        var out = {};
+        if (st) { out.id = st.id; out.url = st.url; }
+        if (text) out.text = text;
+        return out;
+      }
+      var events = [];
+      var cells = document.querySelectorAll('[data-testid="cellInnerDiv"]');
+      for (var i = 0; i < cells.length; i++) {
+        var cell = cells[i];
+        // Skip pure composer / empty chrome
+        var raw = visibleText(cell);
+        if (!raw || raw.length < 2) continue;
+        // Skip tab row
+        if (/^(All|Mentions|Verified|Wszystkie|Wzmianki)/i.test(raw) && raw.length < 40) continue;
+        var type = classifyType(cell, raw);
+        var actors = actorsFrom(cell);
+        // Skip timeline tweets that are just "Following" organic without notif chrome
+        if (type === 'other' && !actors.length && !cell.querySelector('[data-testid="socialContext"]') &&
+            cell.querySelector('article[data-testid="tweet"]')) {
+          // Still emit as mention-ish when on notifications tab
+          type = 'other';
+        }
+        var timeEl = cell.querySelector('time');
+        var time = timeEl
+          ? (timeEl.getAttribute('datetime') || (timeEl.textContent || null))
+          : null;
+        var target = targetFrom(cell);
+        var actorCount = actorCountFrom(raw, actors.length);
+        var ev = {
+          type: type,
+          actors: actors,
+          actorCount: actorCount || actors.length
+        };
+        if (target) ev.target = target;
+        if (time) ev.time = time;
+        // Drop empty noise
+        if (!actors.length && !target && type === 'other') continue;
+        events.push(ev);
+      }
+      return events;
     })()
     """#
 
@@ -532,28 +923,46 @@ enum AgentDOM {
       var tryAgain = [].some.call(document.querySelectorAll('button,a'), function(el) {
         return /^try again$/i.test(((el.innerText || el.textContent || '') + '').trim());
       });
-      var errorShell = (!tweets && !primary && (
+      var reactHidden = false;
+      try {
+        var rr = document.getElementById('react-root');
+        if (rr) {
+          var rst = window.getComputedStyle(rr);
+          reactHidden = rst.display === 'none' || rst.visibility === 'hidden';
+        }
+      } catch (e) {}
+      // failedScript shells often keep stray chrome / CSS primary hints while
+      // hiding #react-root — treat that as error even if primary looks true.
+      var errorShell = reactHidden || (!tweets && !primary && (
         tryAgain ||
         (errCopy.length > 0 && /something went wrong|try again|javascript is disabled/i.test(errCopy)) ||
         /failedscript=/i.test(href) ||
         /something went wrong\.?\s*try again|javascript is disabled/i.test(lower)
-      ));
+      )) || (!tweets && errCopy.length > 0 && tryAgain &&
+        /something went wrong|javascript is disabled/i.test(errCopy));
       var searchPage = /\/search/i.test(path);
+      var statusPage = /\/[^/]+\/status\/\d+/i.test(path);
       var searchEmpty = searchPage && primary && tweets === 0 &&
         /no results|nie znaleziono|nothing matched|try searching for something else|brak wyników/i.test(lower);
+      // Only treat as settled-empty on explicit unavailable copy — never
+      // "something went wrong" (too easy to false-positive mid-hydrate).
+      var statusEmpty = statusPage && primary && tweets === 0 &&
+        /this post (?:isn.?t|is not) available|this post is unavailable|post (?:is )?unavailable|post niedostępny|post doesn.?t exist|nie istnieje|can.?t find this post|nie można znaleźć/i.test(lower);
       var challenge = /\/i\/flow\/login|\/account\/access|arkose|funcaptcha/i.test(href) ||
         /verify you(?:'| a)?re (?:a )?human|confirm you(?:'| a)?re not a bot|complete the challenge/i.test(lower);
-      // Search: only "ready" once tweets land or empty-state copy — not mere primaryColumn
-      // (pushState keeps old chrome briefly before results hydrate).
+      // Search + status: only "ready" once tweets land (or documented empty) —
+      // not mere primaryColumn (SPA chrome hydrates before cards).
       var ready = !errorShell && !challenge && (
-        tweets > 0 || searchEmpty || (!searchPage && primary)
+        tweets > 0 || searchEmpty || statusEmpty || (!searchPage && !statusPage && primary)
       );
       return {
         ready: ready,
         errorShell: errorShell,
         challenge: challenge,
         searchPage: searchPage,
+        statusPage: statusPage,
         searchEmpty: searchEmpty,
+        statusEmpty: statusEmpty,
         tweets: tweets,
         primary: primary,
         href: href,

@@ -9,6 +9,10 @@
  *  4. Write honesty — post/reply/retweet return HTTP 501 (do NOT actually post)
  *  5. Eval gate — MCP tools/list omits eval_js by default; HTTP POST /eval → 404
  *  6. read_column opts — default omits raw text; `limit` truncates tweet cards
+ *  7. G1 metrics — feed cards expose numeric metrics.{replies,reposts,likes,views,bookmarks}
+ *  8. G2 notifications — /notifications column returns typed notifications[]
+ *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
+ * 10. G4 articles — article search yields article.{title,preview} and/or media type article
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -636,6 +640,264 @@ async function scenario6ReadOpts(column) {
   );
 }
 
+function metricSample(tweets) {
+  const keys = ["replies", "reposts", "likes", "views", "bookmarks"];
+  let withAny = 0;
+  let numericOk = 0;
+  const sample = [];
+  for (const t of tweets) {
+    const m = t?.metrics;
+    if (!m || typeof m !== "object") continue;
+    withAny++;
+    let allNum = true;
+    for (const k of keys) {
+      if (m[k] == null) continue;
+      if (typeof m[k] !== "number" || !Number.isFinite(m[k])) allNum = false;
+    }
+    if (allNum) numericOk++;
+    if (sample.length < 3) {
+      sample.push({ id: t.id, handle: t.handle, metrics: m });
+    }
+  }
+  return { withAny, numericOk, sample };
+}
+
+async function scenario7Metrics(column) {
+  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
+  await sleep(1500);
+  const read = await timed(() => readColumn(column, { includeText: false }));
+  if (!read.ok) {
+    return grade(false, false, `read_column failed: ${read.error}`, { read });
+  }
+  const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+  const { withAny, numericOk, sample } = metricSample(tweets);
+  const pass = withAny >= 1 && numericOk >= 1;
+  const partial = !pass && tweets.length >= 1;
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `metrics on ${withAny}/${tweets.length} cards (numeric=${numericOk})`
+      : partial
+        ? `tweets present but no metrics objects (${tweets.length} cards)`
+        : "no tweets and no metrics",
+    { tweetCount: tweets.length, withAny, numericOk, sample }
+  );
+}
+
+async function scenario8Notifications(column) {
+  const nav = await timed(() =>
+    navigateColumn(column, "https://x.com/notifications")
+  );
+  await sleep(2000);
+  const read = await timed(() => readColumn(column, { includeText: false }));
+  if (!read.ok) {
+    return grade(false, false, `read_column failed: ${read.error}`, { nav, read });
+  }
+  const events = Array.isArray(read.value.notifications)
+    ? read.value.notifications
+    : null;
+  const allowed = new Set([
+    "like",
+    "repost",
+    "follow",
+    "mention",
+    "reply",
+    "other",
+  ]);
+  const typed =
+    events &&
+    events.length >= 1 &&
+    events.every(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        allowed.has(e.type) &&
+        Array.isArray(e.actors) &&
+        typeof e.actorCount === "number"
+    );
+  const pass = typed === true;
+  const partial =
+    !pass &&
+    Array.isArray(events) &&
+    (events.length === 0 ||
+      events.some((e) => e && allowed.has(e?.type)));
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `notifications typed events=${events.length}`
+      : partial
+        ? `notifications array present but weak shape (n=${events?.length ?? 0})`
+        : `no notifications[] (nav ok=${nav.ok} ready=${nav.value?.ready})`,
+    {
+      nav: nav.ok
+        ? {
+            ok: nav.value?.ok,
+            ready: nav.value?.ready,
+            tweetCount: nav.value?.tweetCount,
+            waitedMs: nav.value?.waitedMs,
+          }
+        : nav,
+      notificationCount: read.value.notificationCount ?? events?.length ?? null,
+      types: events ? [...new Set(events.map((e) => e.type))] : null,
+      sample: events ? events.slice(0, 3) : null,
+    }
+  );
+}
+
+async function scenario9StatusAd(column) {
+  // Discover a live status URL from the feed first (hardcoded ids rot / error-shell).
+  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
+  await sleep(1200);
+  const feed = await timed(() => readColumn(column, { includeText: false }));
+  const feedTweets = feed.ok && Array.isArray(feed.value.tweets) ? feed.value.tweets : [];
+  const liveUrls = feedTweets
+    .map((t) => t?.url)
+    .filter((u) => typeof u === "string" && /\/status\/\d+/.test(u));
+  // Also try opening a timeline promoted card (often no <time>) as status URL.
+  const adUrls = feedTweets
+    .filter((t) => t?.isAd && t?.url)
+    .map((t) => t.url);
+  const candidates = [...new Set([...adUrls, ...liveUrls])].slice(0, 4);
+
+  let nav = null;
+  let read = null;
+  let ads = [];
+  let tweets = [];
+  for (const url of candidates) {
+    nav = await timed(() => navigateColumn(column, url));
+    await sleep(2000);
+    // Scroll conversation for in-thread promos
+    await timed(() => scrollColumn(column, 1600)).catch(() => {});
+    await sleep(800);
+    await timed(() => scrollColumn(column, 1600)).catch(() => {});
+    await sleep(800);
+    read = await timed(() => readColumn(column, { includeText: false }));
+    if (!read.ok) continue;
+    tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+    ads = tweets.filter((t) => t && t.isAd === true);
+    if (ads.length >= 1) break;
+    if (tweets.length >= 1 && nav?.ok && nav.value?.ready && (nav.value?.tweetCount ?? 0) >= 1) {
+      // Settled status page — keep as partial candidate
+      break;
+    }
+  }
+
+  // Timeline proof of G3 fallback: promoted card with isAd and no <time>
+  const timelineAdsNoTime = feedTweets.filter(
+    (t) => t?.isAd === true && (t.time == null || t.time === "")
+  );
+
+  if (!candidates.length) {
+    return grade(
+      false,
+      feedTweets.some((t) => t?.isAd),
+      "no live status URLs in feed",
+      { feedCount: feedTweets.length, timelineAdsNoTime: timelineAdsNoTime.length }
+    );
+  }
+  if (!read?.ok) {
+    return grade(false, false, `read_column failed: ${read?.error}`, { nav, read });
+  }
+
+  const settled =
+    tweets.length >= 1 &&
+    nav?.ok &&
+    nav.value?.ready === true &&
+    (nav.value?.tweetCount ?? 0) >= 1;
+  const pass = ads.length >= 1 || timelineAdsNoTime.length >= 1;
+  const partial = !pass && settled;
+  return grade(
+    pass,
+    partial,
+    pass
+      ? ads.length >= 1
+        ? `isAd on ${ads.length}/${tweets.length} status cards`
+        : `isAd fallback on timeline promoted (no <time>) count=${timelineAdsNoTime.length}`
+      : partial
+        ? `status settled (${tweets.length} tweets) but no isAd — may be no promo in viewport`
+        : `status navigate/read weak: tweets=${tweets.length} ready=${nav?.value?.ready} navTweets=${nav?.value?.tweetCount}`,
+    {
+      nav: nav?.ok
+        ? {
+            ok: nav.value?.ok,
+            ready: nav.value?.ready,
+            tweetCount: nav.value?.tweetCount,
+            waitedMs: nav.value?.waitedMs,
+            finalUrl: nav.value?.finalUrl,
+          }
+        : nav,
+      tweetCount: tweets.length,
+      adCount: ads.length,
+      timelineAdsNoTime: timelineAdsNoTime.length,
+      adSample: (ads.length ? ads : timelineAdsNoTime).slice(0, 2).map((t) => ({
+        id: t.id,
+        handle: t.handle,
+        time: t.time ?? null,
+        text: (t.text || "").slice(0, 80),
+      })),
+    }
+  );
+}
+
+async function scenario10Articles(column) {
+  // Avoid q=Article alone — search highlights false-positive the Article badge.
+  const urls = [
+    `https://x.com/search?q=${encodeURIComponent("url:x.com/i/article")}&src=typed_query&f=live`,
+    `https://x.com/search?q=${encodeURIComponent('"Artykuł" filter:links')}&src=typed_query&f=live`,
+    `https://x.com/search?q=${encodeURIComponent("from:X filter:has_engagement min_faves:50")}&src=typed_query&f=live`,
+  ];
+  let best = { withArticle: 0, tweets: [], nav: null, read: null };
+  for (const url of urls) {
+    const nav = await timed(() => navigateColumn(column, url));
+    await sleep(2500);
+    const read = await timed(() => readColumn(column, { includeText: false }));
+    if (!read.ok) continue;
+    const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+    const withArticle = tweets.filter(
+      (t) =>
+        (t?.article && (t.article.title || t.article.preview)) ||
+        (Array.isArray(t?.media) && t.media.some((m) => m?.type === "article"))
+    );
+    if (withArticle.length > best.withArticle) {
+      best = { withArticle: withArticle.length, tweets, nav, read, hits: withArticle };
+    }
+    if (withArticle.length >= 1) break;
+  }
+  const pass = best.withArticle >= 1;
+  const partial =
+    !pass && best.tweets.length >= 1 && best.nav?.ok && best.nav.value?.ready;
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `article cards=${best.withArticle}/${best.tweets.length}`
+      : partial
+        ? `search settled but no article title/preview in viewport (${best.tweets.length} tweets)`
+        : "article search failed to settle with tweets",
+    {
+      nav: best.nav?.ok
+        ? {
+            ok: best.nav.value?.ok,
+            ready: best.nav.value?.ready,
+            tweetCount: best.nav.value?.tweetCount,
+            waitedMs: best.nav.value?.waitedMs,
+          }
+        : best.nav,
+      tweetCount: best.tweets.length,
+      articleCount: best.withArticle,
+      sample: (best.hits || []).slice(0, 3).map((t) => ({
+        id: t.id,
+        handle: t.handle,
+        article: t.article,
+        media: t.media,
+        textLen: (t.text || "").length,
+      })),
+    }
+  );
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
@@ -715,6 +977,33 @@ async function main() {
   };
   console.error(`  6 read_column_opts: ${report.scenarios[6].status} — ${report.scenarios[6].reason}`);
 
+  report.scenarios[7] = {
+    name: "g1_metrics",
+    ...(await scenario7Metrics(opts.column)),
+  };
+  console.error(`  7 g1_metrics: ${report.scenarios[7].status} — ${report.scenarios[7].reason}`);
+
+  report.scenarios[8] = {
+    name: "g2_notifications",
+    ...(await scenario8Notifications(opts.column)),
+  };
+  console.error(`  8 g2_notifications: ${report.scenarios[8].status} — ${report.scenarios[8].reason}`);
+
+  report.scenarios[9] = {
+    name: "g3_status_ad",
+    ...(await scenario9StatusAd(opts.column)),
+  };
+  console.error(`  9 g3_status_ad: ${report.scenarios[9].status} — ${report.scenarios[9].reason}`);
+
+  report.scenarios[10] = {
+    name: "g4_articles",
+    ...(await scenario10Articles(opts.column)),
+  };
+  console.error(`  10 g4_articles: ${report.scenarios[10].status} — ${report.scenarios[10].reason}`);
+
+  // Leave column on home for the next human/agent session.
+  await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
+
   report.finishedAt = new Date().toISOString();
   report.summary = {
     1: report.scenarios[1].status,
@@ -723,6 +1012,10 @@ async function main() {
     4: report.scenarios[4].status,
     5: report.scenarios[5].status,
     6: report.scenarios[6].status,
+    7: report.scenarios[7].status,
+    8: report.scenarios[8].status,
+    9: report.scenarios[9].status,
+    10: report.scenarios[10].status,
   };
 
   const out = JSON.stringify(report, null, 2);

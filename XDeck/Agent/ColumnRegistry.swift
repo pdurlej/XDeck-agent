@@ -123,6 +123,8 @@ final class ColumnRegistry {
         var method = "assign"
         var retries = 0
         let isSearch = cleanURL.path.lowercased().contains("/search")
+        let isStatus = cleanURL.path.range(of: "/status/", options: .caseInsensitive) != nil
+        let settleTimeoutMs = (isSearch || isStatus) ? 16_000 : 10_000
         let sameSite = Self.isSameXSite(webView.url, cleanURL)
 
         // If the column is already an error shell, recover to a warm home first.
@@ -188,13 +190,15 @@ final class ColumnRegistry {
 
         var finalProbe = await waitForPage(
             column: index,
-            timeoutMs: isSearch ? 16_000 : 10_000,
+            timeoutMs: settleTimeoutMs,
             acceptSearchEmpty: isSearch,
             requireSearchHref: isSearch ? cleanURL : nil
         )
 
         // Retry error shells: rehydrate via home hard-load, then pushState (never assign search cold).
-        while (finalProbe.errorShell || (!finalProbe.ready && isSearch)) && retries < 2 {
+        // Status pages: also retry when ready=false with tweetCount=0 (SPA still hydrating).
+        while (finalProbe.errorShell ||
+                (!finalProbe.ready && (isSearch || isStatus))) && retries < 2 {
             retries += 1
             method = "retry-pushstate"
             try await hardLoad(webView: webView, url: URL(string: "https://x.com/home")!)
@@ -202,12 +206,17 @@ final class ColumnRegistry {
             if home.ready && !home.errorShell {
                 let soft = await attemptSoftNavigate(column: index, url: cleanURL)
                 if !soft.ok {
-                    let box = await attemptSoftSearch(column: index, url: cleanURL, healthy: true)
-                    if !box.ok {
+                    if isSearch {
+                        let box = await attemptSoftSearch(column: index, url: cleanURL, healthy: true)
+                        if !box.ok {
+                            try await hardLoad(webView: webView, url: cleanURL)
+                            method = "load-retry"
+                        } else {
+                            method = "retry-" + box.method
+                        }
+                    } else {
                         try await hardLoad(webView: webView, url: cleanURL)
                         method = "load-retry"
-                    } else {
-                        method = "retry-" + box.method
                     }
                 }
             } else {
@@ -216,7 +225,7 @@ final class ColumnRegistry {
             }
             finalProbe = await waitForPage(
                 column: index,
-                timeoutMs: isSearch ? 16_000 : 10_000,
+                timeoutMs: settleTimeoutMs,
                 acceptSearchEmpty: isSearch,
                 requireSearchHref: isSearch ? cleanURL : nil
             )
@@ -228,6 +237,9 @@ final class ColumnRegistry {
         }
 
         let waitedMs = Int(Date().timeIntervalSince(started) * 1000)
+        if waitedMs > 10_000 {
+            print("[AgentBridge] navigate slow column=\(index) waitedMs=\(waitedMs) method=\(method) tweets=\(finalProbe.tweets) url=\(cleanURL.absoluteString)")
+        }
         return NavigateResult(
             ok: finalProbe.ready && !finalProbe.errorShell,
             column: index,

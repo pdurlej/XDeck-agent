@@ -537,11 +537,40 @@ final class AgentBridge {
                 }
             }
         }
+        // Notifications column: typed events (likes/follows/reposts of own posts).
+        var notificationsJSON: String?
+        let snap = ColumnRegistry.shared.snapshot().first(where: { $0.index == index })
+        let colURL = snap?.url ?? ColumnRegistry.shared.webView(at: index)?.url?.absoluteString
+        let onNotifications = snap?.type == "notifications" ||
+            (colURL?.range(of: "/notifications", options: .caseInsensitive) != nil)
+        if onNotifications {
+            notificationsJSON = try await ColumnRegistry.shared.evaluateJavaScript(
+                column: index,
+                script: AgentDOM.extractNotificationsJS
+            )
+            if let limit, limit > 0,
+               let data = notificationsJSON?.data(using: .utf8),
+               var arr = try? JSONSerialization.jsonObject(with: data) as? [Any],
+               arr.count > limit {
+                arr = Array(arr.prefix(limit))
+                if let truncated = try? JSONSerialization.data(withJSONObject: arr),
+                   let s = String(data: truncated, encoding: .utf8) {
+                    notificationsJSON = s
+                }
+            }
+        }
         var parts = [
             #""column":\#(index)"#,
             #""challenge":\#(challengeJSON)"#,
             #""tweets":\#(tweetsJSON)"#,
         ]
+        if let notificationsJSON {
+            parts.append(#""notifications":\#(notificationsJSON)"#)
+            if let data = notificationsJSON.data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                parts.append(#""notificationCount":\#(arr.count)"#)
+            }
+        }
         if let challengeNeedsHuman = Self.needsHuman(fromChallengeJSON: challengeJSON) {
             parts.append(#""needs_human":\#(challengeNeedsHuman ? "true" : "false")"#)
         } else {
