@@ -9,6 +9,10 @@
  *  4. Write honesty — post/reply/retweet return HTTP 501 (do NOT actually post)
  *  5. Eval gate — MCP tools/list omits eval_js by default; HTTP POST /eval → 404
  *  6. read_column opts — default omits raw text; `limit` truncates tweet cards
+ *  7. G1 metrics — feed cards expose numeric metrics.{replies,reposts,likes,views,bookmarks}
+ *  8. G2 notifications — /notifications column returns typed notifications[]
+ *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
+ * 10. G4 articles — article search yields article.{title,preview} and/or media type article
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -607,31 +611,408 @@ async function scenario6ReadOpts(column) {
     withText.value.text.length > 0 &&
     withText.value.text.length <= 200;
 
+  // (4) includeText must not dump window.__INITIAL_STATE__ / raw <script>
+  const bigText = await timed(() =>
+    readColumn(column, { includeText: true, maxChars: 50000 })
+  );
+  const raw = bigText.ok ? String(bigText.value.text || "") : "";
+  const noScriptDump =
+    bigText.ok &&
+    !raw.includes("__INITIAL_STATE__") &&
+    !/<script[\s>]/i.test(raw);
+
   const limitOk =
     fullCount === 0
       ? limCount === 0
       : limCount <= 2 && limLen <= 2 && limCount <= fullCount;
 
-  const pass = !hasTextDefault && limitOk && textOptInOk;
+  const pass = !hasTextDefault && limitOk && textOptInOk && noScriptDump;
   const partial =
-    !pass && !hasTextDefault && (limitOk || textOptInOk);
+    !pass && !hasTextDefault && (limitOk || textOptInOk) && noScriptDump;
 
   return grade(
     pass,
     partial,
     pass
-      ? `default omits text; limit=2 → ${limCount} cards; includeText truncates`
+      ? `default omits text; limit=2 → ${limCount}; includeText strips scripts`
       : partial
-        ? `partial: noDefaultText=${!hasTextDefault} limitOk=${limitOk} textOptIn=${textOptInOk}`
-        : `failed: defaultHasText=${hasTextDefault} full=${fullCount} lim=${limCount} textOptIn=${textOptInOk}`,
+        ? `partial: noDefaultText=${!hasTextDefault} limitOk=${limitOk} textOptIn=${textOptInOk} noScript=${noScriptDump}`
+        : `failed: defaultHasText=${hasTextDefault} full=${fullCount} lim=${limCount} textOptIn=${textOptInOk} noScript=${noScriptDump}`,
     {
       fullCount,
       limCount,
       hasTextDefault,
       textOptInOk,
+      noScriptDump,
       textLen: withText.ok ? withText.value.text?.length : null,
+      bigTextLen: bigText.ok ? raw.length : null,
       fullMs: full.ms,
       limitedMs: limited.ms,
+    }
+  );
+}
+
+function metricSample(tweets) {
+  const keys = ["replies", "reposts", "likes", "views", "bookmarks"];
+  let withAny = 0;
+  let numericOk = 0;
+  let bookmarksNull = 0;
+  let bookmarksZero = 0;
+  const sample = [];
+  for (const t of tweets) {
+    const m = t?.metrics;
+    if (!m || typeof m !== "object") continue;
+    withAny++;
+    let allNum = true;
+    for (const k of keys) {
+      if (m[k] == null) continue;
+      if (typeof m[k] !== "number" || !Number.isFinite(m[k])) allNum = false;
+    }
+    if (allNum) numericOk++;
+    if (m.bookmarks === null) bookmarksNull++;
+    if (m.bookmarks === 0) bookmarksZero++;
+    if (sample.length < 3) {
+      sample.push({ id: t.id, handle: t.handle, metrics: m });
+    }
+  }
+  return { withAny, numericOk, bookmarksNull, bookmarksZero, sample };
+}
+
+async function scenario7Metrics(column) {
+  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
+  await sleep(1500);
+  const read = await timed(() => readColumn(column, { includeText: false }));
+  if (!read.ok) {
+    return grade(false, false, `read_column failed: ${read.error}`, { read });
+  }
+  const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+  const { withAny, numericOk, bookmarksNull, bookmarksZero, sample } =
+    metricSample(tweets);
+  // Bug regression: inventing bookmarks:0 on every card when count isn't shown.
+  const bookmarksHonest =
+    withAny === 0 ||
+    bookmarksNull >= 1 ||
+    bookmarksZero < withAny; // not EVERY card forced to 0
+  const pass = withAny >= 1 && numericOk >= 1 && bookmarksHonest;
+  const partial = !pass && tweets.length >= 1 && withAny >= 1;
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `metrics on ${withAny}/${tweets.length} cards (bookmarks null=${bookmarksNull} zero=${bookmarksZero})`
+      : partial
+        ? `metrics weak / bookmarks honesty fail (null=${bookmarksNull} zero=${bookmarksZero}/${withAny})`
+        : "no tweets and no metrics",
+    {
+      tweetCount: tweets.length,
+      withAny,
+      numericOk,
+      bookmarksNull,
+      bookmarksZero,
+      sample,
+    }
+  );
+}
+
+async function scenario8Notifications(column) {
+  const nav = await timed(() =>
+    navigateColumn(column, "https://x.com/notifications")
+  );
+  await sleep(2000);
+  const read = await timed(() => readColumn(column, { includeText: false }));
+  if (!read.ok) {
+    return grade(false, false, `read_column failed: ${read.error}`, { nav, read });
+  }
+  const events = Array.isArray(read.value.notifications)
+    ? read.value.notifications
+    : null;
+  const allowed = new Set([
+    "like",
+    "repost",
+    "follow",
+    "mention",
+    "reply",
+    "other",
+  ]);
+  const typed =
+    events &&
+    events.length >= 1 &&
+    events.every(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        allowed.has(e.type) &&
+        Array.isArray(e.actors) &&
+        typeof e.actorCount === "number"
+    );
+  const withTarget = (events || []).filter(
+    (e) => e?.target && (e.target.text || e.target.id)
+  );
+  const withTargetId = withTarget.filter(
+    (e) => typeof e.target?.id === "string" && e.target.id.length > 0
+  );
+  // Like/repost of own posts should expose target.id/url when possible.
+  const targetIdOk =
+    withTarget.length === 0 || withTargetId.length >= 1;
+  const pass = typed === true && targetIdOk;
+  const partial =
+    !pass &&
+    Array.isArray(events) &&
+    (events.length === 0 ||
+      events.some((e) => e && allowed.has(e?.type)));
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `notifications typed events=${events.length} targetId=${withTargetId.length}/${withTarget.length}`
+      : partial
+        ? `notifications array present but weak shape/target id (n=${events?.length ?? 0} targetId=${withTargetId.length}/${withTarget.length})`
+        : `no notifications[] (nav ok=${nav.ok} ready=${nav.value?.ready})`,
+    {
+      nav: nav.ok
+        ? {
+            ok: nav.value?.ok,
+            ready: nav.value?.ready,
+            tweetCount: nav.value?.tweetCount,
+            waitedMs: nav.value?.waitedMs,
+          }
+        : nav,
+      notificationCount: read.value.notificationCount ?? events?.length ?? null,
+      types: events ? [...new Set(events.map((e) => e.type))] : null,
+      withTarget: withTarget.length,
+      withTargetId: withTargetId.length,
+      sample: events ? events.slice(0, 3) : null,
+    }
+  );
+}
+
+/** Scroll/wait a status conversation like a real agent until replies or ads appear. */
+async function harvestStatusConversation(column, { maxScrolls = 8, delayMs = 900 } = {}) {
+  let best = { tweets: [], ads: [], scrolls: 0 };
+  for (let s = 0; s < maxScrolls; s++) {
+    const read = await timed(() => readColumn(column, { includeText: false }));
+    if (!read.ok) continue;
+    const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+    const ads = tweets.filter((t) => t && t.isAd === true);
+    if (tweets.length > best.tweets.length || ads.length > best.ads.length) {
+      best = { tweets, ads, scrolls: s, read };
+    }
+    if (ads.length >= 1 && tweets.length >= 2) {
+      return { ...best, settled: true };
+    }
+    // Wait for replies to hydrate, then scroll for in-thread promos
+    await sleep(delayMs);
+    await timed(() => scrollColumn(column, 1800)).catch(() => {});
+    await sleep(Math.floor(delayMs * 0.7));
+  }
+  const finalRead = await timed(() => readColumn(column, { includeText: false }));
+  if (finalRead.ok) {
+    const tweets = Array.isArray(finalRead.value.tweets) ? finalRead.value.tweets : [];
+    const ads = tweets.filter((t) => t && t.isAd === true);
+    if (tweets.length > best.tweets.length || ads.length > best.ads.length) {
+      best = { tweets, ads, scrolls: maxScrolls, read: finalRead };
+    }
+  }
+  return {
+    ...best,
+    settled: best.tweets.length >= 1,
+  };
+}
+
+async function scenario9StatusAd(column) {
+  // Discover a live status URL from the feed first (hardcoded ids rot / error-shell).
+  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
+  await sleep(1200);
+  const feed = await timed(() => readColumn(column, { includeText: false }));
+  const feedTweets = feed.ok && Array.isArray(feed.value.tweets) ? feed.value.tweets : [];
+  const liveUrls = feedTweets
+    .map((t) => t?.url)
+    .filter((u) => typeof u === "string" && /\/status\/\d+/.test(u));
+  // Prefer statuses with replies (promo often appears mid-thread after scroll).
+  const busyUrls = feedTweets
+    .filter(
+      (t) =>
+        t?.url &&
+        typeof t?.metrics?.replies === "number" &&
+        t.metrics.replies >= 3
+    )
+    .sort((a, b) => (b.metrics?.replies || 0) - (a.metrics?.replies || 0))
+    .map((t) => t.url);
+  const adUrls = feedTweets
+    .filter((t) => t?.isAd && t?.url)
+    .map((t) => t.url);
+  const candidates = [
+    ...new Set([...busyUrls, ...adUrls, ...liveUrls]),
+  ].slice(0, 4);
+
+  let nav = null;
+  let harvest = { tweets: [], ads: [], scrolls: 0, settled: false };
+  for (const url of candidates) {
+    nav = await timed(() => navigateColumn(column, url));
+    await sleep(1500);
+    harvest = await harvestStatusConversation(column, {
+      maxScrolls: 8,
+      delayMs: 900,
+    });
+    if (harvest.ads.length >= 1) break;
+    if (harvest.tweets.length >= 2) {
+      // Conversation loaded — keep trying next candidate only if no ad yet
+      // but remember this as settled.
+    }
+  }
+
+  const tweets = harvest.tweets || [];
+  const ads = harvest.ads || [];
+
+  // Timeline proof of G3 fallback: promoted card with isAd and no <time>
+  const timelineAdsNoTime = feedTweets.filter(
+    (t) => t?.isAd === true && (t.time == null || t.time === "")
+  );
+
+  if (!candidates.length) {
+    return grade(
+      false,
+      feedTweets.some((t) => t?.isAd),
+      "no live status URLs in feed",
+      { feedCount: feedTweets.length, timelineAdsNoTime: timelineAdsNoTime.length }
+    );
+  }
+
+  const settled =
+    tweets.length >= 1 &&
+    nav?.ok &&
+    nav.value?.ready === true;
+  const repliesLoaded = tweets.length >= 2 || nav?.value?.repliesLoaded === true;
+  const pass = ads.length >= 1 || timelineAdsNoTime.length >= 1;
+  const partial = !pass && settled && repliesLoaded;
+  return grade(
+    pass,
+    partial,
+    pass
+      ? ads.length >= 1
+        ? `isAd on ${ads.length}/${tweets.length} status cards (scrolls=${harvest.scrolls})`
+        : `isAd fallback on timeline promoted (no <time>) count=${timelineAdsNoTime.length}`
+      : partial
+        ? `status harvested (${tweets.length} tweets, scrolls=${harvest.scrolls}) but no isAd in viewport`
+        : `status navigate/read weak: tweets=${tweets.length} ready=${nav?.value?.ready} repliesLoaded=${nav?.value?.repliesLoaded}`,
+    {
+      nav: nav?.ok
+        ? {
+            ok: nav.value?.ok,
+            ready: nav.value?.ready,
+            tweetCount: nav.value?.tweetCount,
+            waitedMs: nav.value?.waitedMs,
+            finalUrl: nav.value?.finalUrl,
+            repliesLoaded: nav.value?.repliesLoaded ?? null,
+          }
+        : nav,
+      tweetCount: tweets.length,
+      adCount: ads.length,
+      scrolls: harvest.scrolls,
+      timelineAdsNoTime: timelineAdsNoTime.length,
+      adSample: (ads.length ? ads : timelineAdsNoTime).slice(0, 2).map((t) => ({
+        id: t.id,
+        handle: t.handle,
+        time: t.time ?? null,
+        text: (t.text || "").slice(0, 80),
+      })),
+    }
+  );
+}
+
+/** Heading-only title: short, not glued heading+body into one string. */
+function articleTitleOk(title) {
+  if (typeof title !== "string" || title.length < 4) return false;
+  if (title.length >= 150) return false;
+  // Glued heading+paragraph often has ". " mid-string then continues as body,
+  // or concatenates without separator into a run-on > ~100 chars with 2+ sentences.
+  const sentences = title.match(/[.!?]["')\]]*\s+[A-ZÀ-ÖØ-Þ]/g);
+  if (sentences && sentences.length >= 1 && title.length > 80) return false;
+  // "HeadingBody" with lowercase→Upper mid-token is rare; reject TLDR glued into title
+  if (/TLDR\s*:/i.test(title) && !/^TLDR\s*:/i.test(title.trim())) return false;
+  return true;
+}
+
+async function scenario10Articles(column) {
+  // Avoid q=Article alone — search highlights false-positive the Article badge.
+  // Include the review query that previously glued heading+body into title.
+  const urls = [
+    `https://x.com/search?q=${encodeURIComponent('"claude opus" filter:links -filter:replies min_retweets:50')}&src=typed_query&f=live`,
+    `https://x.com/search?q=${encodeURIComponent("url:x.com/i/article")}&src=typed_query&f=live`,
+    `https://x.com/search?q=${encodeURIComponent('"Artykuł" filter:links')}&src=typed_query&f=live`,
+  ];
+  let best = { withArticle: 0, cleanTitles: 0, tweets: [], nav: null, read: null };
+  for (const url of urls) {
+    const nav = await timed(() => navigateColumn(column, url));
+    await sleep(2500);
+    const read = await timed(() => readColumn(column, { includeText: false }));
+    if (!read.ok) continue;
+    const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+    const withArticle = tweets.filter(
+      (t) =>
+        (t?.article && (t.article.title || t.article.preview)) ||
+        (Array.isArray(t?.media) && t.media.some((m) => m?.type === "article"))
+    );
+    const withTitle = withArticle.filter(
+      (t) => typeof t?.article?.title === "string" && t.article.title.length > 0
+    );
+    const cleanTitles = withTitle.filter((t) =>
+      articleTitleOk(t.article.title)
+    );
+    if (
+      cleanTitles.length > best.cleanTitles ||
+      (cleanTitles.length === best.cleanTitles &&
+        withArticle.length > best.withArticle)
+    ) {
+      best = {
+        withArticle: withArticle.length,
+        withTitle: withTitle.length,
+        cleanTitles: cleanTitles.length,
+        tweets,
+        nav,
+        read,
+        hits: withArticle,
+      };
+    }
+    if (cleanTitles.length >= 1 && cleanTitles.length === withTitle.length) break;
+  }
+  const withTitleN = best.withTitle || 0;
+  const titlesOk = withTitleN >= 1 && best.cleanTitles === withTitleN;
+  const pass = titlesOk;
+  const partial =
+    !pass &&
+    ((best.cleanTitles >= 1 && best.cleanTitles < withTitleN) ||
+      (best.withArticle >= 1 && best.nav?.ok));
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `article titles clean ${best.cleanTitles}/${withTitleN} (len<150, no glue)`
+      : partial
+        ? `articles=${best.withArticle} titled=${withTitleN} clean=${best.cleanTitles} — glued/long titles remain`
+        : "article search failed to settle with tweets",
+    {
+      nav: best.nav?.ok
+        ? {
+            ok: best.nav.value?.ok,
+            ready: best.nav.value?.ready,
+            tweetCount: best.nav.value?.tweetCount,
+            waitedMs: best.nav.value?.waitedMs,
+          }
+        : best.nav,
+      tweetCount: best.tweets.length,
+      articleCount: best.withArticle,
+      withTitle: withTitleN,
+      cleanTitles: best.cleanTitles,
+      sample: (best.hits || []).slice(0, 3).map((t) => ({
+        id: t.id,
+        handle: t.handle,
+        article: t.article,
+        titleLen: t.article?.title?.length ?? null,
+        titleOk: articleTitleOk(t.article?.title),
+        media: t.media,
+        textLen: (t.text || "").length,
+      })),
     }
   );
 }
@@ -715,6 +1096,33 @@ async function main() {
   };
   console.error(`  6 read_column_opts: ${report.scenarios[6].status} — ${report.scenarios[6].reason}`);
 
+  report.scenarios[7] = {
+    name: "g1_metrics",
+    ...(await scenario7Metrics(opts.column)),
+  };
+  console.error(`  7 g1_metrics: ${report.scenarios[7].status} — ${report.scenarios[7].reason}`);
+
+  report.scenarios[8] = {
+    name: "g2_notifications",
+    ...(await scenario8Notifications(opts.column)),
+  };
+  console.error(`  8 g2_notifications: ${report.scenarios[8].status} — ${report.scenarios[8].reason}`);
+
+  report.scenarios[9] = {
+    name: "g3_status_ad",
+    ...(await scenario9StatusAd(opts.column)),
+  };
+  console.error(`  9 g3_status_ad: ${report.scenarios[9].status} — ${report.scenarios[9].reason}`);
+
+  report.scenarios[10] = {
+    name: "g4_articles",
+    ...(await scenario10Articles(opts.column)),
+  };
+  console.error(`  10 g4_articles: ${report.scenarios[10].status} — ${report.scenarios[10].reason}`);
+
+  // Leave column on home for the next human/agent session.
+  await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
+
   report.finishedAt = new Date().toISOString();
   report.summary = {
     1: report.scenarios[1].status,
@@ -723,6 +1131,10 @@ async function main() {
     4: report.scenarios[4].status,
     5: report.scenarios[5].status,
     6: report.scenarios[6].status,
+    7: report.scenarios[7].status,
+    8: report.scenarios[8].status,
+    9: report.scenarios[9].status,
+    10: report.scenarios[10].status,
   };
 
   const out = JSON.stringify(report, null, 2);

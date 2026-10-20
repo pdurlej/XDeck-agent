@@ -537,11 +537,40 @@ final class AgentBridge {
                 }
             }
         }
+        // Notifications column: typed events (likes/follows/reposts of own posts).
+        var notificationsJSON: String?
+        let snap = ColumnRegistry.shared.snapshot().first(where: { $0.index == index })
+        let colURL = snap?.url ?? ColumnRegistry.shared.webView(at: index)?.url?.absoluteString
+        let onNotifications = snap?.type == "notifications" ||
+            (colURL?.range(of: "/notifications", options: .caseInsensitive) != nil)
+        if onNotifications {
+            notificationsJSON = try await ColumnRegistry.shared.evaluateJavaScript(
+                column: index,
+                script: AgentDOM.extractNotificationsJS
+            )
+            if let limit, limit > 0,
+               let data = notificationsJSON?.data(using: .utf8),
+               var arr = try? JSONSerialization.jsonObject(with: data) as? [Any],
+               arr.count > limit {
+                arr = Array(arr.prefix(limit))
+                if let truncated = try? JSONSerialization.data(withJSONObject: arr),
+                   let s = String(data: truncated, encoding: .utf8) {
+                    notificationsJSON = s
+                }
+            }
+        }
         var parts = [
             #""column":\#(index)"#,
             #""challenge":\#(challengeJSON)"#,
             #""tweets":\#(tweetsJSON)"#,
         ]
+        if let notificationsJSON {
+            parts.append(#""notifications":\#(notificationsJSON)"#)
+            if let data = notificationsJSON.data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                parts.append(#""notificationCount":\#(arr.count)"#)
+            }
+        }
         if let challengeNeedsHuman = Self.needsHuman(fromChallengeJSON: challengeJSON) {
             parts.append(#""needs_human":\#(challengeNeedsHuman ? "true" : "false")"#)
         } else {
@@ -609,8 +638,14 @@ final class AgentBridge {
         let column = try columnFromBody(obj, defaultColumn: defaultColumn)
         let result = try await ColumnRegistry.shared.navigate(column: column, to: url)
         // HTTP 200 with ok:false when SPA did not become ready — agents should read fields.
+        let repliesLoadedJSON: String = {
+            if let flag = result.repliesLoaded {
+                return #","repliesLoaded":\#(flag ? "true" : "false")"#
+            }
+            return ""
+        }()
         return (200, """
-        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs)}
+        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs)\(repliesLoadedJSON)}
         """)
     }
 
@@ -681,6 +716,7 @@ final class AgentBridge {
         for col in columns {
             var challengeJSON = "null"
             var needsHuman = false
+            var visibilityState = "null"
             if col.hasWebView {
                 if let probed = try? await ColumnRegistry.shared.evaluateJavaScript(
                     column: col.index,
@@ -692,10 +728,17 @@ final class AgentBridge {
                         anyNeedsHuman = true
                     }
                 }
+                if let vis = try? await ColumnRegistry.shared.evaluateJavaScript(
+                    column: col.index,
+                    script: AgentDOM.visibilityStateJS
+                ) {
+                    // evaluateJavaScript stringifies JS strings with quotes already
+                    visibilityState = vis
+                }
             }
             colParts.append(
                 """
-                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
+                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"visibilityState":\(visibilityState),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
                 """
             )
         }

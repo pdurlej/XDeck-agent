@@ -101,7 +101,7 @@ server.registerTool(
   {
     title: "Read XDeck column (structured tweets)",
     description:
-      "Read visible tweet cards from a column WebView: id, author, handle, text, time, url when parseable. Sets needs_human (+ challenge.reasons) when the column looks like login, CAPTCHA, or an SPA error shell — do not treat that as feed text. Optionally include raw document.body.innerText. Only what is currently on screen — not topic search.",
+      "Read visible tweet cards from a column WebView: id, author, handle, text, time, url, plus optional metrics/article/inReplyTo/isPinned/isAd/retweetedBy/quoted/media when parseable. On /notifications also returns typed notifications[]. Sets needs_human (+ challenge.reasons) when the column looks like login, CAPTCHA, or an SPA error shell — do not treat that as feed text. Optionally include raw document.body.innerText. Only what is currently on screen.",
     inputSchema: {
       column: z.number().int().min(0).describe("Column index (0-based)"),
       include_text: z
@@ -144,7 +144,7 @@ server.registerTool(
   {
     title: "Navigate column URL",
     description:
-      "Navigate a column to an http(s) URL (e.g. https://x.com/search?q=openrig&src=typed_query&f=live). Prefers in-SPA search-box submit, waits for tweets/ready, retries SPA error shells. Returns ok/ready/tweetCount/method/waitedMs. Then call read_column.",
+      "Navigate a column to an http(s) URL (e.g. https://x.com/search?q=openrig&src=typed_query&f=live or a /status/ URL). Prefers in-SPA search-box submit, waits for tweets/ready on search and status pages, retries SPA error shells. Returns ok/ready/tweetCount/method/waitedMs. Then call read_column.",
     inputSchema: {
       column: z.number().int().min(0).describe("Column index (0-based)"),
       url: z.string().url().describe("Absolute http(s) URL to load"),
