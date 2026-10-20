@@ -13,6 +13,9 @@
  *  8. G2 notifications — /notifications column returns typed notifications[]
  *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
  * 10. G4 articles — article search yields article.{title,preview} and/or media type article
+ * 11. Bind listener — exactly one TCP listener on 18765 and it is 127.0.0.1 (not *)
+ * 12. Bind restart — (opt-in) kill XDeck, relaunch within 5s; unauth /health → 401 within 15s
+ * 13. Eval remains gated — after hasWebView ready, POST /eval → 404 body contains "Eval disabled"
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -20,12 +23,15 @@
  *   node evals/scenarios.mjs --column 0 --query openrig --polls 3
  *
  * Env: XDECK_AGENT_URL, XDECK_AGENT_TOKEN, XDECK_AGENT_TOKEN_FILE (same as CLI)
- *      XDECK_AGENT_EVAL must be unset for scenario 5 (default).
+ *      XDECK_AGENT_EVAL must be unset on the live XDeck app (scenario 5 + 13).
+ *      XDECK_EVAL_ALLOW_BRIDGE_KILL=1 required for scenario 12 — kills the :18765 holder.
+ *      Use a private DerivedData build for kill tests; do not kill Piotr’s shared bridge
+ *      while another reviewer is testing.
  */
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import readline from "node:readline";
 import {
   health,
@@ -510,6 +516,127 @@ async function listMcpTools(env) {
   }
 }
 
+function errorText(body) {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  if (typeof body.error === "string") return body.error;
+  if (typeof body.message === "string") return body.message;
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return String(body);
+  }
+}
+
+/** True only for the intentional eval gate — not "Column N not found" 404s. */
+function isEvalDisabled404(res) {
+  return res?.status === 404 && /Eval disabled/i.test(errorText(res.body));
+}
+
+function isColumnNotFound404(res) {
+  const t = errorText(res?.body);
+  return (
+    res?.status === 404 &&
+    (/Column\s+\d+\s+not found/i.test(t) || /WebView not registered/i.test(t))
+  );
+}
+
+/** Wait until /health lists at least one column with hasWebView:true. */
+async function waitForWebViewColumns({ timeoutMs = 45000 } = {}) {
+  const deadline = nowMs() + timeoutMs;
+  let last = null;
+  while (nowMs() < deadline) {
+    const h = await timed(() => health());
+    last = h;
+    if (h.ok) {
+      const cols = Array.isArray(h.value?.columns) ? h.value.columns : [];
+      const ready = cols.filter((c) => c && c.hasWebView === true);
+      if (ready.length >= 1) {
+        return {
+          ok: true,
+          ms: timeoutMs - (deadline - nowMs()),
+          columnCount: cols.length,
+          readyCount: ready.length,
+          health: h.value,
+        };
+      }
+    }
+    await sleep(500);
+  }
+  return { ok: false, last };
+}
+
+/**
+ * After WebViews are registered: POST /eval must be 404 with body "Eval disabled".
+ * A Column-not-found 404 is retried, then failed — never treated as gated.
+ */
+async function assertHttpEvalDisabled() {
+  const ready = await waitForWebViewColumns();
+  if (!ready.ok) {
+    return {
+      ok: false,
+      reason:
+        "timed out waiting for /health columns with hasWebView:true before eval-disabled check",
+      evidence: { ready },
+    };
+  }
+
+  let httpEval = null;
+  let httpColEval = null;
+  let attempts = 0;
+  for (let i = 0; i < 8; i++) {
+    attempts = i + 1;
+    httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
+    httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
+    if (isColumnNotFound404(httpEval) || isColumnNotFound404(httpColEval)) {
+      await sleep(1000);
+      continue;
+    }
+    break;
+  }
+
+  if (isColumnNotFound404(httpEval) || isColumnNotFound404(httpColEval)) {
+    return {
+      ok: false,
+      reason:
+        "POST /eval still Column-not-found/WebView-not-registered 404 after wait — not a valid Eval disabled signal",
+      evidence: {
+        ready,
+        attempts,
+        httpEval: { status: httpEval.status, body: httpEval.body },
+        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      },
+    };
+  }
+
+  const disabled =
+    isEvalDisabled404(httpEval) && isEvalDisabled404(httpColEval);
+  if (disabled) {
+    return {
+      ok: true,
+      reason:
+        "POST /eval and /columns/0/eval return 404 with Eval disabled (after hasWebView ready)",
+      evidence: {
+        ready,
+        attempts,
+        httpEval: { status: httpEval.status, body: httpEval.body },
+        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    reason: `expected 404 Eval disabled after WebViews ready; got /eval=${httpEval.status} (${errorText(httpEval.body).slice(0, 120)}) /columns/0/eval=${httpColEval.status}`,
+    evidence: {
+      ready,
+      attempts,
+      httpEval: { status: httpEval.status, body: httpEval.body },
+      httpColEval: { status: httpColEval.status, body: httpColEval.body },
+    },
+  };
+}
+
 async function scenario5EvalGate() {
   const evalEnv = String(process.env.XDECK_AGENT_EVAL || "")
     .trim()
@@ -529,11 +656,7 @@ async function scenario5EvalGate() {
   }
   const evalAbsent = !mcp.names.includes("eval_js");
 
-  const httpEval = await rawPost("/eval", { column: 0, js: "1+1" });
-  const httpColEval = await rawPost("/columns/0/eval", { js: "1+1" });
-  // Bridge returns 404 when XDECK_AGENT_EVAL unset (documented).
-  const http404 =
-    httpEval.status === 404 && httpColEval.status === 404;
+  const httpGate = await assertHttpEvalDisabled();
 
   if (evalOptIn) {
     // Suite still passes MCP default check; HTTP may be 200 if app also has EVAL.
@@ -547,28 +670,26 @@ async function scenario5EvalGate() {
       {
         mcpTools: mcp.names,
         evalAbsent,
-        httpEval: { status: httpEval.status, body: httpEval.body },
-        httpColEval: { status: httpColEval.status, body: httpColEval.body },
+        httpGate,
         harnessEvalOptIn: true,
       }
     );
   }
 
-  const pass = evalAbsent && http404;
-  const partial = evalAbsent && !http404;
+  const pass = evalAbsent && httpGate.ok;
+  const partial = evalAbsent && !httpGate.ok;
   return grade(
     pass,
     partial,
     pass
-      ? "eval_js absent from tools/list; POST /eval and /columns/0/eval return 404"
+      ? "eval_js absent from tools/list; POST /eval returns 404 Eval disabled"
       : partial
-        ? `MCP omits eval_js but HTTP eval not 404 (got ${httpEval.status}/${httpColEval.status}) — rebuild app without XDECK_AGENT_EVAL`
-        : `eval gate failed: mcpHasEval=${!evalAbsent} http=${httpEval.status}/${httpColEval.status}`,
+        ? `MCP omits eval_js but HTTP gate failed: ${httpGate.reason}`
+        : `eval gate failed: mcpHasEval=${!evalAbsent}; ${httpGate.reason}`,
     {
       mcpTools: mcp.names,
       evalAbsent,
-      httpEval: { status: httpEval.status, body: httpEval.body },
-      httpColEval: { status: httpColEval.status, body: httpColEval.body },
+      httpGate,
       harnessEvalOptIn: false,
     }
   );
@@ -1017,6 +1138,266 @@ async function scenario10Articles(column) {
   );
 }
 
+function listListen18765() {
+  const port = 18765;
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  try {
+    stdout = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], {
+      encoding: "utf8",
+    });
+  } catch (err) {
+    exitCode = typeof err.status === "number" ? err.status : 1;
+    stdout = err.stdout?.toString?.() || err.stdout || "";
+    stderr = err.stderr?.toString?.() || err.stderr || "";
+  }
+
+  const lines = String(stdout)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("COMMAND"));
+
+  const listeners = lines.map((line) => {
+    const m = line.match(/TCP\s+(\S+):(\d+)\s+\(LISTEN\)/i);
+    return {
+      line,
+      addr: m ? m[1] : null,
+      port: m ? Number(m[2]) : null,
+    };
+  });
+
+  return { port, stdout, stderr, exitCode, listeners };
+}
+
+/** Assert exactly one TCP listener on 18765 and it is 127.0.0.1 (not * / ::). */
+async function scenario11BindListener() {
+  const { port, stdout, stderr, exitCode, listeners } = listListen18765();
+
+  const wildcard = listeners.some(
+    (l) =>
+      l.addr === "*" ||
+      l.addr === "::" ||
+      l.addr === "[::]" ||
+      l.addr === "0.0.0.0"
+  );
+  const onlyLoopback =
+    listeners.length === 1 && listeners[0].addr === "127.0.0.1" && listeners[0].port === port;
+
+  if (onlyLoopback && !wildcard) {
+    return grade(true, false, "exactly one 127.0.0.1:18765 listener (no wildcard)", {
+      listeners,
+      lsof: stdout.trim(),
+    });
+  }
+
+  return grade(
+    false,
+    false,
+    `expected exactly one 127.0.0.1:${port} listener, got ${listeners.length} (wildcard=${wildcard})`,
+    { listeners, lsof: stdout.trim(), stderr: String(stderr).trim(), exitCode }
+  );
+}
+
+/**
+ * Best-effort: whether the holder process has XDECK_AGENT_EVAL set.
+ * macOS often hides environ; treat unknown as false (still never *add* EVAL on relaunch).
+ */
+function holderEnvHasAgentEval(pid) {
+  try {
+    const out = execFileSync("ps", ["eww", "-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+    });
+    return /\bXDECK_AGENT_EVAL=1\b/.test(out);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Kill the XDeck that owns :18765, relaunch the same .app within 5s, and require
+ * unauthenticated GET /health → HTTP 401 within 15s (proves TIME_WAIT reclaim works).
+ *
+ * Opt-in only: set XDECK_EVAL_ALLOW_BRIDGE_KILL=1 on a *private* DerivedData instance.
+ * Never enable XDECK_AGENT_EVAL on relaunch (security: would leave HTTP /eval open).
+ */
+async function scenario12BindRestart() {
+  const port = 18765;
+  const base = (process.env.XDECK_AGENT_URL || DEFAULT_BASE).replace(/\/$/, "");
+  const allowKill = String(process.env.XDECK_EVAL_ALLOW_BRIDGE_KILL || "") === "1";
+
+  if (!allowKill) {
+    return grade(
+      false,
+      true,
+      "skipped bind_restart kill — set XDECK_EVAL_ALLOW_BRIDGE_KILL=1 only on a private DerivedData bridge (never shared review sessions)",
+      { allowKill: false }
+    );
+  }
+
+  let holderPid = null;
+  let appPath = null;
+  try {
+    const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], {
+      encoding: "utf8",
+    });
+    const line = out
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l && !l.startsWith("COMMAND"));
+    const m = line && line.match(/^\S+\s+(\d+)\s+/);
+    holderPid = m ? Number(m[1]) : null;
+  } catch {
+    return grade(false, false, "no listener on 18765 before restart test", {});
+  }
+
+  if (!holderPid) {
+    return grade(false, false, "could not parse listener PID", {});
+  }
+
+  try {
+    appPath = execFileSync("ps", ["-p", String(holderPid), "-o", "command="], {
+      encoding: "utf8",
+    })
+      .trim()
+      .replace(/\/Contents\/MacOS\/XDeck$/, "");
+  } catch (err) {
+    return grade(false, false, `ps failed for pid ${holderPid}: ${err.message || err}`, {
+      holderPid,
+    });
+  }
+
+  if (!appPath || !appPath.endsWith(".app")) {
+    return grade(false, false, `could not resolve .app path from pid ${holderPid}`, {
+      holderPid,
+      appPath,
+    });
+  }
+
+  // Refuse to kill obvious shared / Applications installs even with the opt-in flag.
+  if (/\/Applications\/XDeck\.app$/i.test(appPath) || /\/XDeck-agent-bridge\//i.test(appPath)) {
+    return grade(
+      false,
+      true,
+      `refusing to kill shared-looking bridge at ${appPath}`,
+      { holderPid, appPath }
+    );
+  }
+
+  const holderHadEval = holderEnvHasAgentEval(holderPid);
+  const killStarted = nowMs();
+  try {
+    process.kill(holderPid, "SIGTERM");
+  } catch (err) {
+    return grade(false, false, `kill ${holderPid} failed: ${err.message || err}`, {
+      holderPid,
+      appPath,
+    });
+  }
+
+  // Wait until port is no longer LISTEN (or process exits), up to ~5s budget for relaunch.
+  for (let i = 0; i < 20; i++) {
+    await sleep(100);
+    try {
+      process.kill(holderPid, 0);
+    } catch {
+      break;
+    }
+  }
+
+  const relaunchAt = nowMs();
+  const relaunchDelayMs = relaunchAt - killStarted;
+  if (relaunchDelayMs > 5000) {
+    return grade(false, false, `relaunch delayed ${relaunchDelayMs}ms (>5s) after kill`, {
+      holderPid,
+      appPath,
+      relaunchDelayMs,
+    });
+  }
+
+  // Security: relaunch with ONLY XDECK_AGENT=1. Never pass XDECK_AGENT_EVAL — even if
+  // the killed holder had it (ps eww often cannot confirm). Leaving EVAL on a live
+  // logged-in session exposes POST /eval.
+  const relaunchEnv = ["XDECK_AGENT=1"];
+  const openArgs = ["-n", "--env", "XDECK_AGENT=1", appPath];
+  const child = spawn("open", openArgs, {
+    stdio: "ignore",
+  });
+  await new Promise((resolve) => child.once("exit", resolve));
+
+  const deadline = nowMs() + 15000;
+  let lastStatus = 0;
+  let lastError = null;
+  let readyMs = null;
+  while (nowMs() < deadline) {
+    try {
+      const res = await fetch(`${base}/health`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      lastStatus = res.status;
+      if (res.status === 401) {
+        readyMs = nowMs() - relaunchAt;
+        break;
+      }
+    } catch (err) {
+      lastStatus = 0;
+      lastError = err.message || String(err);
+    }
+    await sleep(250);
+  }
+
+  const after = listListen18765();
+  const onlyLoopback =
+    after.listeners.length === 1 &&
+    after.listeners[0].addr === "127.0.0.1" &&
+    after.listeners[0].port === port;
+
+  if (lastStatus === 401 && onlyLoopback) {
+    return grade(true, false, `health 401 in ${readyMs}ms after relaunch; single 127.0.0.1 listener`, {
+      holderPid,
+      appPath,
+      relaunchDelayMs,
+      readyMs,
+      holderHadEval,
+      relaunchEnv,
+      listeners: after.listeners,
+      lsof: after.stdout.trim(),
+    });
+  }
+
+  return grade(
+    false,
+    false,
+    `expected unauth /health 401 within 15s + one 127.0.0.1 listener; got status=${lastStatus} listeners=${after.listeners.length}`,
+    {
+      holderPid,
+      appPath,
+      relaunchDelayMs,
+      readyMs,
+      lastStatus,
+      lastError,
+      holderHadEval,
+      relaunchEnv,
+      listeners: after.listeners,
+      lsof: after.stdout.trim(),
+    }
+  );
+}
+
+/**
+ * End-of-suite: HTTP eval must stay gated on whatever bridge is left running.
+ * Requires hasWebView-ready columns, then 404 whose body contains "Eval disabled".
+ * Column-not-found 404 must never count as pass.
+ */
+async function scenario13EvalRemainsGated() {
+  const httpGate = await assertHttpEvalDisabled();
+  if (httpGate.ok) {
+    return grade(true, false, httpGate.reason, httpGate.evidence);
+  }
+  return grade(false, false, httpGate.reason, httpGate.evidence);
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
@@ -1120,8 +1501,29 @@ async function main() {
   };
   console.error(`  10 g4_articles: ${report.scenarios[10].status} — ${report.scenarios[10].reason}`);
 
-  // Leave column on home for the next human/agent session.
+  report.scenarios[11] = {
+    name: "bind_listener",
+    ...(await scenario11BindListener()),
+  };
+  console.error(`  11 bind_listener: ${report.scenarios[11].status} — ${report.scenarios[11].reason}`);
+
+  report.scenarios[12] = {
+    name: "bind_restart",
+    ...(await scenario12BindRestart()),
+  };
+  console.error(`  12 bind_restart: ${report.scenarios[12].status} — ${report.scenarios[12].reason}`);
+
+  // Leave column on home for the next human/agent session (best-effort).
   await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
+
+  // Must run last: never leave HTTP eval enabled on the shared bridge.
+  report.scenarios[13] = {
+    name: "eval_remains_gated",
+    ...(await scenario13EvalRemainsGated()),
+  };
+  console.error(
+    `  13 eval_remains_gated: ${report.scenarios[13].status} — ${report.scenarios[13].reason}`
+  );
 
   report.finishedAt = new Date().toISOString();
   report.summary = {
@@ -1135,6 +1537,9 @@ async function main() {
     8: report.scenarios[8].status,
     9: report.scenarios[9].status,
     10: report.scenarios[10].status,
+    11: report.scenarios[11].status,
+    12: report.scenarios[12].status,
+    13: report.scenarios[13].status,
   };
 
   const out = JSON.stringify(report, null, 2);
