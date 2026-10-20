@@ -55,6 +55,29 @@ async function timed(fn) {
   }
 }
 
+function parsePacingWaitMs(nav) {
+  if (!nav || nav.ok) return null;
+  const msg = String(nav.error || nav.body?.error || "");
+  if (nav.status !== 429 && !/pacing|Too Many Requests/i.test(msg)) return null;
+  const m = msg.match(/wait\s+(\d+)\s*ms/i);
+  return m ? Number(m[1]) : 5000;
+}
+
+async function navigateWithRetry(column, url, { agentId, attempts = 5 } = {}) {
+  let last = null;
+  for (let i = 0; i < attempts; i++) {
+    last = await timed(() =>
+      navigateColumn(column, url, agentId ? { agentId } : {})
+    );
+    if (last.ok) return last;
+    if (last.status === 403) return last;
+    const waitMs = parsePacingWaitMs(last);
+    if (waitMs == null || i === attempts - 1) return last;
+    await sleep(waitMs + 150);
+  }
+  return last;
+}
+
 function grade(pass, partial, reason, evidence) {
   return {
     status: pass ? "pass" : partial ? "partial" : "fail",
@@ -126,9 +149,7 @@ async function evalAgentSearchScroll(query) {
   const searchUrl = `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query&f=live`;
 
   try {
-    const nav = await timed(() =>
-      navigateColumn(column, searchUrl, { agentId })
-    );
+    const nav = await navigateWithRetry(column, searchUrl, { agentId });
     if (!nav.ok) {
       return grade(false, false, `navigate agent column failed: ${nav.error}`, {
         column,

@@ -51,24 +51,77 @@ import {
 } from "../lib/client.js";
 
 /**
- * Prefer agent-only columns for navigate/scroll so Piotr's visible deck stays put.
- * Falls back to the requested user column only when acquire fails (old builds).
+ * Acquire an agent-only column for navigate/scroll, then release.
+ * Never falls back to a user column (that yields 403 / false passes on stale content).
  */
-async function withAgentNav(agentId, preferredColumn, fn) {
+async function withAgentNav(agentId, _preferredColumn, fn) {
   const acq = await timed(() => acquireColumn(agentId, { ttl: 180 }));
-  if (acq.ok && typeof acq.value?.column === "number") {
-    const column = acq.value.column;
-    try {
-      return await fn(column, agentId, { usedAgent: true, acquire: acq.value });
-    } finally {
-      await releaseColumn({ agentId }).catch(() => {});
-    }
+  if (!acq.ok || typeof acq.value?.column !== "number") {
+    return grade(
+      false,
+      false,
+      `acquire_column failed — cannot navigate/scroll without an agent column: ${acq.error || "no column"}`,
+      { acq }
+    );
   }
-  // Legacy bridge without agent columns — try user column (may 403 on new builds).
-  return fn(preferredColumn, undefined, {
-    usedAgent: false,
-    acquireError: acq.error,
-  });
+  const column = acq.value.column;
+  try {
+    return await fn(column, agentId, { usedAgent: true, acquire: acq.value });
+  } finally {
+    await releaseColumn({ agentId }).catch(() => {});
+  }
+}
+
+/** True when navigate/scroll was refused to protect the human deck. */
+function isNavForbidden(nav) {
+  if (!nav || nav.ok) return false;
+  if (nav.status === 403) return true;
+  const msg = String(nav.error || nav.body?.error || "");
+  return (
+    /\b403\b/.test(msg) ||
+    /refused by default/i.test(msg) ||
+    /protect the human deck/i.test(msg) ||
+    /requires an active lease/i.test(msg)
+  );
+}
+
+/** Grade fail immediately on 403 — never continue and pass on stale user-column content. */
+function failIfNavForbidden(nav, evidence = {}) {
+  if (!isNavForbidden(nav)) return null;
+  return grade(
+    false,
+    false,
+    `navigate/scroll forbidden (403) — must acquire an agent column: ${nav.error || nav.body?.error || "403"}`,
+    { nav, ...evidence }
+  );
+}
+
+/** Parse agent-column nav pacing wait from a 429 error body. */
+function parsePacingWaitMs(nav) {
+  if (!nav || nav.ok) return null;
+  const msg = String(nav.error || nav.body?.error || "");
+  if (nav.status !== 429 && !/pacing|Too Many Requests/i.test(msg)) return null;
+  const m = msg.match(/wait\s+(\d+)\s*ms/i);
+  return m ? Number(m[1]) : 5000;
+}
+
+/**
+ * Navigate with retry on 429 pacing (agent columns share a min interval across scenarios).
+ * Still fails immediately on 403.
+ */
+async function navigateWithRetry(column, url, { agentId, attempts = 5 } = {}) {
+  let last = null;
+  for (let i = 0; i < attempts; i++) {
+    last = await timed(() =>
+      navigateColumn(column, url, agentId ? { agentId } : {})
+    );
+    if (last.ok) return last;
+    if (isNavForbidden(last)) return last;
+    const waitMs = parsePacingWaitMs(last);
+    if (waitMs == null || i === attempts - 1) return last;
+    await sleep(waitMs + 150);
+  }
+  return last;
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -173,9 +226,7 @@ function grade(pass, partial, reason, evidence) {
  * until structured tweets appear OR a stable honest empty (needs_human=false).
  */
 async function scenario1FeedBrowse(column) {
-  // Best-effort home — after kill/relaunch column 0 may still be about:blank.
-  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
-
+  // Read-only: do not navigate user column 0 (403 without ALLOW_USER_NAV).
   const wv = await waitForWebViewColumns({ timeoutMs: 45000 });
   if (!wv.ok) {
     return grade(
@@ -328,9 +379,9 @@ async function scenario1FeedBrowse(column) {
 async function scenario2TopicSearch(column, query) {
   const url = `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query&f=live`;
   return withAgentNav("eval-scenario2", column, async (navColumn, agentId, meta) => {
-  const nav = await timed(() =>
-    navigateColumn(navColumn, url, agentId ? { agentId } : {})
-  );
+  const nav = await navigateWithRetry(navColumn, url, { agentId });
+  const forbidden = failIfNavForbidden(nav, { url, meta });
+  if (forbidden) return forbidden;
   if (!nav.ok) {
     return grade(false, false, `navigate_column failed: ${nav.error}`, {
       url,
@@ -416,6 +467,15 @@ async function readColumnSettled(column, { attempts = 8, delayMs = 700 } = {}) {
 }
 
 async function scenario3Periodic(column, polls, pollDelayMs) {
+  return withAgentNav("eval-scenario3", column, async (navColumn, agentId, meta) => {
+  // Warm agent column on home so scroll/read have a feed to poll.
+  const homeNav = await navigateWithRetry(navColumn, "https://x.com/home", {
+    agentId,
+  });
+  const homeForbidden = failIfNavForbidden(homeNav, { meta });
+  if (homeForbidden) return homeForbidden;
+  await sleep(1200);
+
   const cycles = [];
   let crashed = false;
   let crashError = null;
@@ -425,7 +485,11 @@ async function scenario3Periodic(column, polls, pollDelayMs) {
       if (i > 0) {
         // Prefer scroll for diffing; reload once at the end to prove no crash
         if (i < polls - 1) {
-          const sc = await timed(() => scrollColumn(column, 600));
+          const sc = await timed(() =>
+            scrollColumn(navColumn, 600, { agentId })
+          );
+          const scrollForbidden = failIfNavForbidden(sc, { meta, cycle: i });
+          if (scrollForbidden) return scrollForbidden;
           cycles.push({
             kind: "scroll",
             ok: sc.ok,
@@ -433,7 +497,7 @@ async function scenario3Periodic(column, polls, pollDelayMs) {
             error: sc.error || null,
           });
         } else {
-          const rl = await timed(() => reloadColumn(column));
+          const rl = await timed(() => reloadColumn(navColumn));
           cycles.push({
             kind: "reload",
             ok: rl.ok,
@@ -444,8 +508,8 @@ async function scenario3Periodic(column, polls, pollDelayMs) {
       }
       const read =
         i === 0
-          ? await timed(() => readColumn(column, { includeText: false }))
-          : await readColumnSettled(column);
+          ? await timed(() => readColumn(navColumn, { includeText: false }))
+          : await readColumnSettled(navColumn);
       if (!read.ok) {
         cycles.push({
           kind: "read",
@@ -524,7 +588,7 @@ async function scenario3Periodic(column, polls, pollDelayMs) {
     pass,
     partial,
     pass
-      ? `${reads.length} poll reads ok; stableOverlap=${stableOverlap}; pairwiseOk=${pairwiseOk}`
+      ? `${reads.length} poll reads ok on agent col ${navColumn}; stableOverlap=${stableOverlap}; pairwiseOk=${pairwiseOk}`
       : crashed
         ? `crashed: ${crashError}`
         : partial
@@ -532,6 +596,8 @@ async function scenario3Periodic(column, polls, pollDelayMs) {
           : `insufficient successful reads (${reads.length}/${polls})`,
     {
       pollsRequested: polls,
+      navColumn,
+      meta,
       cycles,
       stableOverlap,
       pairwiseOk,
@@ -539,6 +605,7 @@ async function scenario3Periodic(column, polls, pollDelayMs) {
       diffPossible: idsComparable,
     }
   );
+  });
 }
 
 async function scenario4WriteHonesty() {
@@ -827,9 +894,7 @@ async function scenario5EvalGate() {
 }
 
 async function scenario6ReadOpts(column) {
-  // Ensure a home timeline (scenario 2 may leave search/empty chrome briefly).
-  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
-  await sleep(1200);
+  // Read-only on user column — no navigate (would 403 without ALLOW_USER_NAV).
   const full = await timed(() => readColumn(column, { includeText: false }));
   if (!full.ok) {
     return grade(false, false, `read_column failed: ${full.error}`, { full });
@@ -931,8 +996,7 @@ function metricSample(tweets) {
 }
 
 async function scenario7Metrics(column) {
-  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
-  await sleep(1500);
+  // Read-only on user column — no navigate.
   const read = await timed(() => readColumn(column, { includeText: false }));
   if (!read.ok) {
     return grade(false, false, `read_column failed: ${read.error}`, { read });
@@ -968,13 +1032,13 @@ async function scenario7Metrics(column) {
 
 async function scenario8Notifications(column) {
   return withAgentNav("eval-scenario8", column, async (navColumn, agentId, meta) => {
-  const nav = await timed(() =>
-    navigateColumn(
-      navColumn,
-      "https://x.com/notifications",
-      agentId ? { agentId } : {}
-    )
+  const nav = await navigateWithRetry(
+    navColumn,
+    "https://x.com/notifications",
+    { agentId }
   );
+  const forbidden = failIfNavForbidden(nav, { meta });
+  if (forbidden) return forbidden;
   await sleep(2000);
   const read = await timed(() => readColumn(navColumn, { includeText: false }));
   if (!read.ok) {
@@ -1122,12 +1186,12 @@ async function scenario8Notifications(column) {
 /** N4: nonexistent status must fail fast (not 2×16s retries ≈ 54s). */
 async function scenario14StatusNotFound(column) {
   const fakeId = "1999999999999999999";
-  // Neutral public handle (hygiene) + agent-column lease for navigate.
+  // Neutral public handle — do not hardcode a personal account in public evals.
   const url = `https://x.com/example/status/${fakeId}`;
   return withAgentNav("eval-scenario14", column, async (navColumn, agentId, meta) => {
-  const nav = await timed(() =>
-    navigateColumn(navColumn, url, agentId ? { agentId } : {})
-  );
+  const nav = await navigateWithRetry(navColumn, url, { agentId });
+  const forbidden = failIfNavForbidden(nav, { url, meta });
+  if (forbidden) return forbidden;
   if (!nav.ok) {
     return grade(false, false, `navigate failed: ${nav.error}`, { nav, meta });
   }
@@ -1169,22 +1233,30 @@ async function scenario14StatusNotFound(column) {
 }
 
 /** Scroll/wait a status conversation like a real agent until replies or ads appear. */
-async function harvestStatusConversation(column, { maxScrolls = 8, delayMs = 900 } = {}) {
-  let best = { tweets: [], ads: [], scrolls: 0 };
+async function harvestStatusConversation(
+  column,
+  { maxScrolls = 8, delayMs = 900, agentId } = {}
+) {
+  let best = { tweets: [], ads: [], scrolls: 0, scrollForbidden: null };
   for (let s = 0; s < maxScrolls; s++) {
     const read = await timed(() => readColumn(column, { includeText: false }));
     if (!read.ok) continue;
     const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
     const ads = tweets.filter((t) => t && t.isAd === true);
     if (tweets.length > best.tweets.length || ads.length > best.ads.length) {
-      best = { tweets, ads, scrolls: s, read };
+      best = { tweets, ads, scrolls: s, read, scrollForbidden: null };
     }
     if (ads.length >= 1 && tweets.length >= 2) {
       return { ...best, settled: true };
     }
     // Wait for replies to hydrate, then scroll for in-thread promos
     await sleep(delayMs);
-    await timed(() => scrollColumn(column, 1800)).catch(() => {});
+    const sc = await timed(() =>
+      scrollColumn(column, 1800, agentId ? { agentId } : {})
+    );
+    if (isNavForbidden(sc)) {
+      return { ...best, settled: false, scrollForbidden: sc };
+    }
     await sleep(Math.floor(delayMs * 0.7));
   }
   const finalRead = await timed(() => readColumn(column, { includeText: false }));
@@ -1192,7 +1264,7 @@ async function harvestStatusConversation(column, { maxScrolls = 8, delayMs = 900
     const tweets = Array.isArray(finalRead.value.tweets) ? finalRead.value.tweets : [];
     const ads = tweets.filter((t) => t && t.isAd === true);
     if (tweets.length > best.tweets.length || ads.length > best.ads.length) {
-      best = { tweets, ads, scrolls: maxScrolls, read: finalRead };
+      best = { tweets, ads, scrolls: maxScrolls, read: finalRead, scrollForbidden: null };
     }
   }
   return {
@@ -1202,9 +1274,7 @@ async function harvestStatusConversation(column, { maxScrolls = 8, delayMs = 900
 }
 
 async function scenario9StatusAd(column) {
-  // Discover a live status URL from the feed first (hardcoded ids rot / error-shell).
-  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
-  await sleep(1200);
+  // Discover status URLs from the user feed (read-only — no navigate on col 0).
   const feed = await timed(() => readColumn(column, { includeText: false }));
   const feedTweets = feed.ok && Array.isArray(feed.value.tweets) ? feed.value.tweets : [];
   const liveUrls = feedTweets
@@ -1227,26 +1297,7 @@ async function scenario9StatusAd(column) {
     ...new Set([...busyUrls, ...adUrls, ...liveUrls]),
   ].slice(0, 4);
 
-  let nav = null;
-  let harvest = { tweets: [], ads: [], scrolls: 0, settled: false };
-  for (const url of candidates) {
-    nav = await timed(() => navigateColumn(column, url));
-    await sleep(1500);
-    harvest = await harvestStatusConversation(column, {
-      maxScrolls: 8,
-      delayMs: 900,
-    });
-    if (harvest.ads.length >= 1) break;
-    if (harvest.tweets.length >= 2) {
-      // Conversation loaded — keep trying next candidate only if no ad yet
-      // but remember this as settled.
-    }
-  }
-
-  const tweets = harvest.tweets || [];
-  const ads = harvest.ads || [];
-
-  // Timeline proof of G3 fallback: promoted card with isAd and no <time>
+  // Timeline ads are context only — never a pass path (avoids false pass on stale col 0).
   const timelineAdsNoTime = feedTweets.filter(
     (t) => t?.isAd === true && (t.time == null || t.time === "")
   );
@@ -1260,24 +1311,55 @@ async function scenario9StatusAd(column) {
     );
   }
 
+  return withAgentNav("eval-scenario9", column, async (navColumn, agentId, meta) => {
+  let nav = null;
+  let harvest = { tweets: [], ads: [], scrolls: 0, settled: false };
+  for (const url of candidates) {
+    nav = await navigateWithRetry(navColumn, url, { agentId });
+    const forbidden = failIfNavForbidden(nav, { meta, url, navColumn });
+    if (forbidden) return forbidden;
+    if (!nav.ok) continue;
+    await sleep(1500);
+    harvest = await harvestStatusConversation(navColumn, {
+      maxScrolls: 8,
+      delayMs: 900,
+      agentId,
+    });
+    if (harvest.scrollForbidden) {
+      return failIfNavForbidden(harvest.scrollForbidden, {
+        meta,
+        url,
+        navColumn,
+        phase: "scroll",
+      });
+    }
+    if (harvest.ads.length >= 1) break;
+  }
+
+  const tweets = harvest.tweets || [];
+  const ads = harvest.ads || [];
+
+  // Pass only from agent-column harvest after a successful navigate — never from
+  // stale user-column timeline ads when navigate was refused.
+  const navSucceeded = Boolean(nav?.ok);
   const settled =
     tweets.length >= 1 &&
-    nav?.ok &&
+    navSucceeded &&
     nav.value?.ready === true;
   const repliesLoaded = tweets.length >= 2 || nav?.value?.repliesLoaded === true;
-  const pass = ads.length >= 1 || timelineAdsNoTime.length >= 1;
-  const partial = !pass && settled && repliesLoaded;
+  const pass = navSucceeded && ads.length >= 1;
+  const partial = !pass && navSucceeded && settled && repliesLoaded;
   return grade(
     pass,
     partial,
     pass
-      ? ads.length >= 1
-        ? `isAd on ${ads.length}/${tweets.length} status cards (scrolls=${harvest.scrolls})`
-        : `isAd fallback on timeline promoted (no <time>) count=${timelineAdsNoTime.length}`
+      ? `isAd on ${ads.length}/${tweets.length} status cards (agent col ${navColumn}, scrolls=${harvest.scrolls})`
       : partial
         ? `status harvested (${tweets.length} tweets, scrolls=${harvest.scrolls}) but no isAd in viewport`
-        : `status navigate/read weak: tweets=${tweets.length} ready=${nav?.value?.ready} repliesLoaded=${nav?.value?.repliesLoaded}`,
+        : `status navigate/read weak: navOk=${navSucceeded} tweets=${tweets.length} ready=${nav?.value?.ready} repliesLoaded=${nav?.value?.repliesLoaded}`,
     {
+      navColumn,
+      meta,
       nav: nav?.ok
         ? {
             ok: nav.value?.ok,
@@ -1292,7 +1374,7 @@ async function scenario9StatusAd(column) {
       adCount: ads.length,
       scrolls: harvest.scrolls,
       timelineAdsNoTime: timelineAdsNoTime.length,
-      adSample: (ads.length ? ads : timelineAdsNoTime).slice(0, 2).map((t) => ({
+      adSample: ads.slice(0, 2).map((t) => ({
         id: t.id,
         handle: t.handle,
         time: t.time ?? null,
@@ -1300,6 +1382,7 @@ async function scenario9StatusAd(column) {
       })),
     }
   );
+  });
 }
 
 /** Heading-only title: short, not glued heading+body into one string. */
@@ -1323,11 +1406,18 @@ async function scenario10Articles(column) {
     `https://x.com/search?q=${encodeURIComponent("url:x.com/i/article")}&src=typed_query&f=live`,
     `https://x.com/search?q=${encodeURIComponent('"Artykuł" filter:links')}&src=typed_query&f=live`,
   ];
+  return withAgentNav("eval-scenario10", column, async (navColumn, agentId, meta) => {
   let best = { withArticle: 0, cleanTitles: 0, tweets: [], nav: null, read: null };
+  let anyNavOk = false;
   for (const url of urls) {
-    const nav = await timed(() => navigateColumn(column, url));
+    const nav = await navigateWithRetry(navColumn, url, { agentId });
+    const forbidden = failIfNavForbidden(nav, { meta, url, navColumn });
+    if (forbidden) return forbidden;
+    if (nav.ok) anyNavOk = true;
     await sleep(2500);
-    const read = await timed(() => readColumn(column, { includeText: false }));
+    const read = await timed(() =>
+      readColumn(navColumn, { includeText: false })
+    );
     if (!read.ok) continue;
     const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
     const withArticle = tweets.filter(
@@ -1359,21 +1449,27 @@ async function scenario10Articles(column) {
     if (cleanTitles.length >= 1 && cleanTitles.length === withTitle.length) break;
   }
   const withTitleN = best.withTitle || 0;
-  const titlesOk = withTitleN >= 1 && best.cleanTitles === withTitleN;
+  const titlesOk = anyNavOk && withTitleN >= 1 && best.cleanTitles === withTitleN;
   const pass = titlesOk;
   const partial =
     !pass &&
+    anyNavOk &&
     ((best.cleanTitles >= 1 && best.cleanTitles < withTitleN) ||
       (best.withArticle >= 1 && best.nav?.ok));
   return grade(
     pass,
     partial,
     pass
-      ? `article titles clean ${best.cleanTitles}/${withTitleN} (len<150, no glue)`
+      ? `article titles clean ${best.cleanTitles}/${withTitleN} on agent col ${navColumn} (len<150, no glue)`
       : partial
         ? `articles=${best.withArticle} titled=${withTitleN} clean=${best.cleanTitles} — glued/long titles remain`
-        : "article search failed to settle with tweets",
+        : anyNavOk
+          ? "article search failed to settle with tweets"
+          : "article navigate failed on all candidate URLs",
     {
+      navColumn,
+      meta,
+      anyNavOk,
       nav: best.nav?.ok
         ? {
             ok: best.nav.value?.ok,
@@ -1397,6 +1493,7 @@ async function scenario10Articles(column) {
       })),
     }
   );
+  });
 }
 
 function listListen18765() {
@@ -1764,12 +1861,7 @@ async function main() {
   };
   console.error(`  2 topic_search: ${report.scenarios[2].status} — ${report.scenarios[2].reason}`);
 
-  // After topic search, leave user columns alone (agent nav was released).
-  // Best-effort home only if ALLOW_USER_NAV is on — otherwise 403 is expected.
-  await timed(() =>
-    navigateColumn(opts.column, "https://x.com/home")
-  ).catch(() => {});
-  await sleep(500);
+  // Do not navigate user columns between scenarios (403 without ALLOW_USER_NAV).
 
   report.scenarios[3] = {
     name: "periodic_poll",

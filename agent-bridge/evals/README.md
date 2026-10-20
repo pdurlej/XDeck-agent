@@ -39,7 +39,7 @@ Focused suite (search + scroll + lease expiry + column-0 unchanged):
 npm run evals:agent-columns -- --query openrig
 ```
 
-Navigate/scroll in scenarios prefer `acquire_column` so Piotr’s visible deck is not moved.
+Navigate/scroll **must** `acquire_column` (no user-column fallback). A **403** on navigate grades **fail** — never pass on stale column-0 content. Scenario 1 / 6 / 7 are read-only on the user deck.
 
 Exit code `1` if any scenario is `fail`; `partial` still exits `0`.
 
