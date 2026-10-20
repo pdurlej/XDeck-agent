@@ -89,49 +89,35 @@ final class AgentBridge: ObservableObject {
         }
 
         // Bind ONLY to 127.0.0.1 via requiredLocalEndpoint.
-        // Do NOT fall back to requiredInterfaceType=.loopback (that reintroduces
-        // IPv6 wildcard *:18765). Never set allowLocalEndpointReuse on NWListener.
-        // Exclusive Darwin preflight (SO_REUSEADDR off) fails loud on EADDRINUSE.
-        try attachListener()
+        // allowLocalEndpointReuse=true so quick restart can reclaim the port during
+        // TIME_WAIT. Do NOT fall back to requiredInterfaceType=.loopback (that
+        // reintroduces IPv6 wildcard *:18765 — the original two-bridges bug).
+        // No exclusive Darwin preflight (SO_REUSEADDR off false-positives on TIME_WAIT).
+        attachListener(attempt: 1)
         print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused))")
         Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused)")
     }
 
-    /// Bind IPv4 loopback only. On constructor throw or `.failed`, surface error
-    /// and stop — never fall back to a wildcard listener.
-    private func attachListener() throws {
+    private static let maxBindAttempts = 3
+    private static let bindRetryDelayNs: UInt64 = 2_000_000_000
+
+    /// Bind IPv4 loopback only. On constructor throw / `.waiting` / `.failed` with
+    /// EADDRINUSE, retry up to 3× with 2s backoff, then surface `bindError`.
+    /// Never fall back to a wildcard / interface-loopback listener.
+    private func attachListener(attempt: Int) {
         let port = self.port
         let host = bindHost
         let bindMode = "requiredLocalEndpoint:\(host)"
-
-        // Exclusive preflight: prove the port is free without SO_REUSEADDR.
-        // Closes before NWListener starts. Prefer fail over wildcard fallback.
-        do {
-            try Self.assertExclusiveLoopbackPort(host: host, port: port)
-        } catch {
-            let message = Self.describeBindFailure(error, host: host, port: port)
-            bindError = message
-            isRunning = false
-            isBinding = false
-            boundEndpoint = nil
-            print("[AgentBridge] \(message)")
-            Self.writeStatus(message)
-            throw AgentBridgeError.bindFailed(message)
-        }
+        isBinding = true
+        bindError = nil
 
         let listener: NWListener
         let parameters: NWParameters
         do {
             (listener, parameters) = try Self.makeLoopbackListener(host: host, port: port)
         } catch {
-            let message = Self.describeBindFailure(error, host: host, port: port)
-            bindError = message
-            isRunning = false
-            isBinding = false
-            boundEndpoint = nil
-            print("[AgentBridge] \(message)")
-            Self.writeStatus(message)
-            throw AgentBridgeError.bindFailed(message)
+            scheduleOrFailBind(error, host: host, port: port, attempt: attempt, phase: "constructor")
+            return
         }
 
         self.listener?.cancel()
@@ -156,20 +142,18 @@ final class AgentBridge: ObservableObject {
             case .failed(let error):
                 Task { @MainActor in
                     guard let self else { return }
-                    let message = Self.describeBindFailure(error, host: host, port: port)
-                    print("[AgentBridge] listener .failed (\(bindMode)): \(message)")
-                    Self.writeStatus("listener .failed mode=\(bindMode): \(message)")
+                    print("[AgentBridge] listener .failed (\(bindMode)): \(error)")
+                    Self.writeStatus("listener .failed mode=\(bindMode): \(error)")
                     self.listener?.cancel()
                     self.listener = nil
                     self.isRunning = false
-                    self.isBinding = false
                     self.boundEndpoint = nil
-                    self.bindError = message
                     // Intentionally NO fallback to interfaceType=.loopback /
                     // wildcard *:port — prefer a dead bridge over an open bind.
+                    self.scheduleOrFailBind(error, host: host, port: port, attempt: attempt, phase: "failed")
                 }
             case .waiting(let error):
-                // Address-in-use often surfaces as .waiting first.
+                // Address-in-use (real peer) often surfaces as .waiting first.
                 let message = Self.describeBindFailure(error, host: host, port: port)
                 print("[AgentBridge] listener waiting (\(bindMode)): \(message)")
                 Self.writeStatus("listener waiting mode=\(bindMode): \(message)")
@@ -179,9 +163,8 @@ final class AgentBridge: ObservableObject {
                         self.listener?.cancel()
                         self.listener = nil
                         self.isRunning = false
-                        self.isBinding = false
                         self.boundEndpoint = nil
-                        self.bindError = message
+                        self.scheduleOrFailBind(error, host: host, port: port, attempt: attempt, phase: "waiting")
                     }
                 }
             case .setup:
@@ -196,55 +179,45 @@ final class AgentBridge: ObservableObject {
         self.listener = listener
         // Not running until .ready — avoids advertising a dead bind.
         isRunning = false
-        print("[AgentBridge] bind=\(bindMode) (awaiting .ready)")
-        Self.writeStatus("bind=\(bindMode) awaiting .ready")
+        print("[AgentBridge] bind=\(bindMode) attempt \(attempt)/\(Self.maxBindAttempts) (awaiting .ready)")
+        Self.writeStatus("bind=\(bindMode) attempt \(attempt)/\(Self.maxBindAttempts) awaiting .ready")
     }
 
-    /// Darwin bind to `host:port` with SO_REUSEADDR/SO_REUSEPORT off.
-    /// Succeeds only when nothing else owns the endpoint; socket is closed after.
-    nonisolated private static func assertExclusiveLoopbackPort(host: String, port: UInt16) throws {
-        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-        guard fd >= 0 else {
-            throw AgentBridgeError.bindFailed("socket() failed errno=\(errno)")
-        }
-        defer { close(fd) }
-
-        var off: Int32 = 0
-        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &off, socklen_t(MemoryLayout.size(ofValue: off)))
-        #if os(macOS)
-        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &off, socklen_t(MemoryLayout.size(ofValue: off)))
-        #endif
-
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        let ok = host.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
-        guard ok == 1 else {
-            throw AgentBridgeError.bindFailed("inet_pton failed for \(host)")
-        }
-
-        let bindRC: Int32 = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    /// Retry EADDRINUSE up to `maxBindAttempts` with 2s backoff; otherwise set `bindError`.
+    private func scheduleOrFailBind(
+        _ error: Error,
+        host: String,
+        port: UInt16,
+        attempt: Int,
+        phase: String
+    ) {
+        let message = Self.describeBindFailure(error, host: host, port: port)
+        if Self.isAddressInUse(error), attempt < Self.maxBindAttempts {
+            let next = attempt + 1
+            print("[AgentBridge] \(phase) EADDRINUSE attempt \(attempt)/\(Self.maxBindAttempts); retry in 2s")
+            Self.writeStatus("\(phase) EADDRINUSE attempt \(attempt)/\(Self.maxBindAttempts); retry in 2s")
+            isBinding = true
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: Self.bindRetryDelayNs)
+                guard !self.isRunning else { return }
+                self.attachListener(attempt: next)
             }
+            return
         }
-        if bindRC != 0 {
-            let err = errno
-            if err == EADDRINUSE {
-                throw POSIXError(.EADDRINUSE)
-            }
-            throw AgentBridgeError.bindFailed("exclusive bind \(host):\(port) failed errno=\(err)")
-        }
-        // Hold briefly so a racing peer also sees the port taken, then release for NWListener.
-        _ = listen(fd, 1)
+        bindError = message
+        isRunning = false
+        isBinding = false
+        boundEndpoint = nil
+        print("[AgentBridge] \(message)")
+        Self.writeStatus(message)
     }
 
-    /// Explicit IPv4 loopback via `requiredLocalEndpoint` (no `on:`, no reuse, no wildcard).
+    /// Explicit IPv4 loopback via `requiredLocalEndpoint` (no `on:`, no wildcard).
+    /// `allowLocalEndpointReuse` lets a quick restart reclaim TIME_WAIT on 127.0.0.1;
+    /// a second live listener on the same endpoint still fails with EADDRINUSE.
     private static func makeLoopbackListener(host: String, port: UInt16) throws -> (NWListener, NWParameters) {
         let parameters = NWParameters.tcp
-        // Do NOT set allowLocalEndpointReuse — dual-bind of *:18765 relied on reuse
-        // plus the interfaceType=.loopback fallback. Exclusive preflight owns EADDRINUSE.
+        parameters.allowLocalEndpointReuse = true
         let nwPort = NWEndpoint.Port(rawValue: port)!
         // String host form matches the bind that historically reached `.ready` under sandbox.
         parameters.requiredLocalEndpoint = .hostPort(host: .init(host), port: nwPort)

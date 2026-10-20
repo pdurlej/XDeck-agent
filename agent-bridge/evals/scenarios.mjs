@@ -14,6 +14,7 @@
  *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
  * 10. G4 articles — article search yields article.{title,preview} and/or media type article
  * 11. Bind listener — exactly one TCP listener on 18765 and it is 127.0.0.1 (not *)
+ * 12. Bind restart — kill XDeck, relaunch within 5s; unauth /health → 401 within 15s (TIME_WAIT reclaim)
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -1018,8 +1019,7 @@ async function scenario10Articles(column) {
   );
 }
 
-/** Assert exactly one TCP listener on 18765 and it is 127.0.0.1 (not * / ::). */
-async function scenario11BindListener() {
+function listListen18765() {
   const port = 18765;
   let stdout = "";
   let stderr = "";
@@ -1048,6 +1048,13 @@ async function scenario11BindListener() {
     };
   });
 
+  return { port, stdout, stderr, exitCode, listeners };
+}
+
+/** Assert exactly one TCP listener on 18765 and it is 127.0.0.1 (not * / ::). */
+async function scenario11BindListener() {
+  const { port, stdout, stderr, exitCode, listeners } = listListen18765();
+
   const wildcard = listeners.some(
     (l) =>
       l.addr === "*" ||
@@ -1070,6 +1077,143 @@ async function scenario11BindListener() {
     false,
     `expected exactly one 127.0.0.1:${port} listener, got ${listeners.length} (wildcard=${wildcard})`,
     { listeners, lsof: stdout.trim(), stderr: String(stderr).trim(), exitCode }
+  );
+}
+
+/**
+ * Kill the XDeck that owns :18765, relaunch the same .app within 5s, and require
+ * unauthenticated GET /health → HTTP 401 within 15s (proves TIME_WAIT reclaim works).
+ */
+async function scenario12BindRestart() {
+  const port = 18765;
+  const base = (process.env.XDECK_AGENT_URL || DEFAULT_BASE).replace(/\/$/, "");
+  let holderPid = null;
+  let appPath = null;
+  try {
+    const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], {
+      encoding: "utf8",
+    });
+    const line = out
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l && !l.startsWith("COMMAND"));
+    const m = line && line.match(/^\S+\s+(\d+)\s+/);
+    holderPid = m ? Number(m[1]) : null;
+  } catch {
+    return grade(false, false, "no listener on 18765 before restart test", {});
+  }
+
+  if (!holderPid) {
+    return grade(false, false, "could not parse listener PID", {});
+  }
+
+  try {
+    appPath = execFileSync("ps", ["-p", String(holderPid), "-o", "command="], {
+      encoding: "utf8",
+    })
+      .trim()
+      .replace(/\/Contents\/MacOS\/XDeck$/, "");
+  } catch (err) {
+    return grade(false, false, `ps failed for pid ${holderPid}: ${err.message || err}`, {
+      holderPid,
+    });
+  }
+
+  if (!appPath || !appPath.endsWith(".app")) {
+    return grade(false, false, `could not resolve .app path from pid ${holderPid}`, {
+      holderPid,
+      appPath,
+    });
+  }
+
+  const killStarted = nowMs();
+  try {
+    process.kill(holderPid, "SIGTERM");
+  } catch (err) {
+    return grade(false, false, `kill ${holderPid} failed: ${err.message || err}`, {
+      holderPid,
+      appPath,
+    });
+  }
+
+  // Wait until port is no longer LISTEN (or process exits), up to ~5s budget for relaunch.
+  for (let i = 0; i < 20; i++) {
+    await sleep(100);
+    try {
+      process.kill(holderPid, 0);
+    } catch {
+      break;
+    }
+  }
+
+  const relaunchAt = nowMs();
+  const relaunchDelayMs = relaunchAt - killStarted;
+  if (relaunchDelayMs > 5000) {
+    return grade(false, false, `relaunch delayed ${relaunchDelayMs}ms (>5s) after kill`, {
+      holderPid,
+      appPath,
+      relaunchDelayMs,
+    });
+  }
+
+  const child = spawn("open", ["-n", "--env", "XDECK_AGENT=1", "--env", "XDECK_AGENT_EVAL=1", appPath], {
+    stdio: "ignore",
+  });
+  await new Promise((resolve) => child.once("exit", resolve));
+
+  const deadline = nowMs() + 15000;
+  let lastStatus = 0;
+  let lastError = null;
+  let readyMs = null;
+  while (nowMs() < deadline) {
+    try {
+      const res = await fetch(`${base}/health`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      lastStatus = res.status;
+      if (res.status === 401) {
+        readyMs = nowMs() - relaunchAt;
+        break;
+      }
+    } catch (err) {
+      lastStatus = 0;
+      lastError = err.message || String(err);
+    }
+    await sleep(250);
+  }
+
+  const after = listListen18765();
+  const onlyLoopback =
+    after.listeners.length === 1 &&
+    after.listeners[0].addr === "127.0.0.1" &&
+    after.listeners[0].port === port;
+
+  if (lastStatus === 401 && onlyLoopback) {
+    return grade(true, false, `health 401 in ${readyMs}ms after relaunch; single 127.0.0.1 listener`, {
+      holderPid,
+      appPath,
+      relaunchDelayMs,
+      readyMs,
+      listeners: after.listeners,
+      lsof: after.stdout.trim(),
+    });
+  }
+
+  return grade(
+    false,
+    false,
+    `expected unauth /health 401 within 15s + one 127.0.0.1 listener; got status=${lastStatus} listeners=${after.listeners.length}`,
+    {
+      holderPid,
+      appPath,
+      relaunchDelayMs,
+      readyMs,
+      lastStatus,
+      lastError,
+      listeners: after.listeners,
+      lsof: after.stdout.trim(),
+    }
   );
 }
 
@@ -1182,7 +1326,13 @@ async function main() {
   };
   console.error(`  11 bind_listener: ${report.scenarios[11].status} — ${report.scenarios[11].reason}`);
 
-  // Leave column on home for the next human/agent session.
+  report.scenarios[12] = {
+    name: "bind_restart",
+    ...(await scenario12BindRestart()),
+  };
+  console.error(`  12 bind_restart: ${report.scenarios[12].status} — ${report.scenarios[12].reason}`);
+
+  // Leave column on home for the next human/agent session (best-effort after restart).
   await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
 
   report.finishedAt = new Date().toISOString();
@@ -1198,6 +1348,7 @@ async function main() {
     9: report.scenarios[9].status,
     10: report.scenarios[10].status,
     11: report.scenarios[11].status,
+    12: report.scenarios[12].status,
   };
 
   const out = JSON.stringify(report, null, 2);
