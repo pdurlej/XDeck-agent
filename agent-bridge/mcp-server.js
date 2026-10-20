@@ -196,26 +196,39 @@ server.registerTool(
   }
 );
 
-server.registerTool(
-  "eval_js",
-  {
-    title: "Eval JS in XDeck column (powerful)",
-    description:
-      "Evaluate JavaScript in a column WKWebView. NOT read-only: the page is a logged-in x.com SPA — this can click, type, or post. Prefer read_column / navigate_column / scroll_column. Only use when a human explicitly asks. No cookie dump tool.",
-    inputSchema: {
-      column: z.number().int().min(0).describe("Column index (0-based)"),
-      js: z.string().min(1).describe("JavaScript source to evaluate"),
+/**
+ * eval_js is powerful (can mutate the logged-in SPA). Register only when
+ * XDECK_AGENT_EVAL=1|true|yes — mirrors HTTP POST /eval gate (404 when unset).
+ */
+function evalOptInEnabled() {
+  const v = String(process.env.XDECK_AGENT_EVAL || "")
+    .trim()
+    .toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+if (evalOptInEnabled()) {
+  server.registerTool(
+    "eval_js",
+    {
+      title: "Eval JS in XDeck column (powerful)",
+      description:
+        "Evaluate JavaScript in a column WKWebView. NOT read-only: the page is a logged-in x.com SPA — this can click, type, or post. Prefer read_column / navigate_column / scroll_column. Only use when a human explicitly asks. Requires XDECK_AGENT_EVAL=1 on both MCP and the XDeck app. No cookie dump tool.",
+      inputSchema: {
+        column: z.number().int().min(0).describe("Column index (0-based)"),
+        js: z.string().min(1).describe("JavaScript source to evaluate"),
+      },
+      annotations: EVAL_POWERFUL,
     },
-    annotations: EVAL_POWERFUL,
-  },
-  async ({ column, js }) => {
-    try {
-      return jsonResult(await evalJs(column, js));
-    } catch (err) {
-      return errorResult(err);
+    async ({ column, js }) => {
+      try {
+        return jsonResult(await evalJs(column, js));
+      } catch (err) {
+        return errorResult(err);
+      }
     }
-  }
-);
+  );
+}
 
 async function main() {
   const transport = new StdioServerTransport();

@@ -33,7 +33,9 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 | `navigate_column` | SPA-safe navigate (pushState / search-box); waits for search tweets / retries error shells |
 | `scroll_column` | Scroll timeline viewport |
 | `reload_column` | Reload WebView |
-| `eval_js` | Escape hatch — **not** read-only; can mutate the SPA |
+| `eval_js` | **Opt-in only** (`XDECK_AGENT_EVAL=1` on MCP **and** the XDeck app). Absent from `tools/list` by default; HTTP `POST /eval` → **404** when unset. Powerful — can mutate the SPA |
+
+`read_column` tweet cards may include `isAd`, `retweetedBy`, `quoted`, `media` when present. Status `url` is normalized (never `/analytics`).
 
 `click` / `type` / `post_tweet` / … return **HTTP 501 Not Implemented** (honest — not “needs confirm”).
 

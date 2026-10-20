@@ -85,6 +85,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 curl -sS -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:18765/columns/0/text
 
+# Eval is opt-in (XDECK_AGENT_EVAL=1 on the app). When unset → HTTP 404.
 curl -sS -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"column":0,"js":"document.title"}' \

@@ -26,9 +26,11 @@ Or: `npm run evals`
 | 2 | Topic search | `navigate_column` to `https://x.com/search?q=…&f=live`; ready; tweets ≥1 **or** documented SPA/`errorShell` fail |
 | 3 | Periodic poll | 2–3 `read_column` cycles (+ optional scroll/reload); stable/comparable ids; no crash |
 | 4 | Write honesty | `POST /post_tweet`, `/reply`, `/retweet` → **HTTP 501** (never actually posts) |
+| 5 | Eval gate | MCP `tools/list` omits `eval_js` by default; `POST /eval` + `/columns/0/eval` → **HTTP 404** when `XDECK_AGENT_EVAL` unset |
 
 Exit code `1` if any scenario is `fail`; `partial` still exits `0`.
 
 ## Env
 
-Same as CLI/MCP: `XDECK_AGENT_URL`, `XDECK_AGENT_TOKEN`, `XDECK_AGENT_TOKEN_FILE`.
+Same as CLI/MCP: `XDECK_AGENT_URL`, `XDECK_AGENT_TOKEN`, `XDECK_AGENT_TOKEN_FILE`.  
+Scenario 5 expects `XDECK_AGENT_EVAL` **unset** on the running XDeck app (and harness clears it for the MCP spawn).

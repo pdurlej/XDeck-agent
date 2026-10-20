@@ -11,6 +11,9 @@ final class AgentBridge {
 
     static let defaultPort: UInt16 = 18765
     static let envFlag = "XDECK_AGENT"
+    /// Opt-in for powerful `POST /eval` and `/columns/:i/eval`. Off by default.
+    /// When unset, those routes return **HTTP 404** (same as an unregistered path).
+    static let evalEnvFlag = "XDECK_AGENT_EVAL"
 
     private(set) var isRunning = false
     private(set) var port: UInt16 = AgentBridge.defaultPort
@@ -23,7 +26,16 @@ final class AgentBridge {
     private init() {}
 
     static var isEnabledByEnvironment: Bool {
-        let value = ProcessInfo.processInfo.environment[envFlag]?
+        envFlagEnabled(envFlag)
+    }
+
+    /// `XDECK_AGENT_EVAL=1` (or true/yes) enables HTTP eval. Default: disabled → 404.
+    static var isEvalEnabledByEnvironment: Bool {
+        envFlagEnabled(evalEnvFlag)
+    }
+
+    private static func envFlagEnabled(_ name: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[name]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         return value == "1" || value == "true" || value == "yes"
@@ -387,8 +399,10 @@ final class AgentBridge {
             let index = try parseColumnIndex(path: path, suffix: "/tweets")
             return (200, try await readColumnJSON(index: index, includeText: false))
         case ("POST", "/eval"):
+            try requireEvalEnabled()
             return try await handleEval(body: body, defaultColumn: nil)
         case ("POST", _) where path.hasPrefix("/columns/") && path.hasSuffix("/eval"):
+            try requireEvalEnabled()
             let index = try parseColumnIndex(path: path, suffix: "/eval")
             return try await handleEval(body: body, defaultColumn: index)
         case ("POST", "/navigate"):
@@ -502,6 +516,13 @@ final class AgentBridge {
         let column = try columnFromBody(obj, defaultColumn: defaultColumn)
         try ColumnRegistry.shared.reload(column: column)
         return (200, #"{"ok":true,"column":\#(column),"reloaded":true}"#)
+    }
+
+    /// Eval is opt-in. Unset → **HTTP 404** (route treated as unregistered; not 401/403).
+    private func requireEvalEnabled() throws {
+        guard Self.isEvalEnabledByEnvironment else {
+            throw AgentBridgeError.evalDisabled
+        }
     }
 
     private func handleEval(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
