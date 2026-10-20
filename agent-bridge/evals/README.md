@@ -30,7 +30,7 @@ Or: `npm run evals`
 | 6 | read_column opts | Default response omits raw `text`; `limit=2` truncates cards; `includeText` opt-in works |
 | 11 | Bind listener | Exactly one TCP listener on `18765` and it is `127.0.0.1` |
 | 12 | Bind restart | **Opt-in** (`XDECK_EVAL_ALLOW_BRIDGE_KILL=1`): kill + relaunch private DerivedData app; unauth `/health` → **401** within 15s. Relaunch uses **only** `XDECK_AGENT=1` — never `XDECK_AGENT_EVAL`. |
-| 13 | Eval remains gated | End-of-suite: `POST /eval` → **404** on whatever bridge is left running |
+| 13 | Eval remains gated | End-of-suite: wait for `hasWebView:true`, then `POST /eval` → **404** whose body contains **`Eval disabled`**. Column-not-found 404 must retry/fail — never pass. |
 
 Exit code `1` if any scenario is `fail`; `partial` still exits `0`.
 
