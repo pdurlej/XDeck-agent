@@ -17,7 +17,7 @@ function usage() {
 Usage:
   xdeck-agent health
   xdeck-agent columns
-  xdeck-agent read <columnIndex> [--no-text] [--max-chars N]
+  xdeck-agent read <columnIndex> [--text] [--limit N] [--max-chars N]
   xdeck-agent navigate <columnIndex> <url>
   xdeck-agent scroll <columnIndex> [deltaY]
   xdeck-agent reload <columnIndex>
@@ -50,12 +50,16 @@ async function main() {
         const index = Number(rest[0]);
         if (!Number.isInteger(index)) usage();
         let maxChars;
+        let limit;
         const maxIdx = rest.indexOf("--max-chars");
         if (maxIdx >= 0) maxChars = Number(rest[maxIdx + 1]);
-        const includeText = !rest.includes("--no-text");
+        const limitIdx = rest.indexOf("--limit");
+        if (limitIdx >= 0) limit = Number(rest[limitIdx + 1]);
+        // Raw text is opt-in; --no-text kept as a no-op alias for older scripts.
+        const includeText = rest.includes("--text");
         console.log(
           JSON.stringify(
-            await readColumn(index, { maxChars, includeText }),
+            await readColumn(index, { maxChars, includeText, limit }),
             null,
             2
           )

@@ -29,7 +29,7 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 | Tool / route | Role |
 |--------------|------|
 | `health` / `list_columns` | Session + column metadata; `health` includes per-column `needs_human` / `challenge` |
-| `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`) + `needs_human` on login/CAPTCHA/error shell |
+| `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`) + `needs_human` on login/CAPTCHA/error shell. Raw `innerText` is **opt-in** (`include_text`); optional `limit` caps card count |
 | `navigate_column` | SPA-safe navigate (pushState / search-box); waits for search tweets / retries error shells |
 | `scroll_column` | Scroll timeline viewport |
 | `reload_column` | Reload WebView |
@@ -44,12 +44,13 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 ```sh
 git clone https://github.com/pdurlej/XDeck-agent.git
 cd XDeck-agent
-open XDeck.xcodeproj
-# Scheme XDeck → Debug (shared scheme sets XDECK_AGENT=1)
-# Sign with your Apple Development team; keep bundle id me.morishin.XDeck to reuse WebKit login
+# Debug is ad-hoc by default (no DEVELOPMENT_TEAM / CODE_SIGN_IDENTITY=-):
+xcodebuild -scheme XDeck -configuration Debug build
+# Or open XDeck.xcodeproj — Scheme XDeck → Debug (shared scheme sets XDECK_AGENT=1)
+# Keep bundle id me.morishin.XDeck to reuse WebKit login. Release still uses the project team.
 ```
 
-Debug uses `XDeck/XDeck.Debug.entitlements` (`network.server` + home-relative App Support exception). Release uses `XDeck/XDeck.entitlements` (**no** server).
+Debug uses `XDeck/XDeck.Debug.entitlements` (`network.server` + home-relative App Support exception) and **ad-hoc** signing so `xcodebuild` works without a local cert. Release uses `XDeck/XDeck.entitlements` (**no** server) + team signing.
 
 ### curl smoke
 

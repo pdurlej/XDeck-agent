@@ -8,6 +8,7 @@
  *  3. Periodic poll — 2–3 read_column cycles with stable ids / diff; no crash
  *  4. Write honesty — post/reply/retweet return HTTP 501 (do NOT actually post)
  *  5. Eval gate — MCP tools/list omits eval_js by default; HTTP POST /eval → 404
+ *  6. read_column opts — default omits raw text; `limit` truncates tweet cards
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -569,6 +570,72 @@ async function scenario5EvalGate() {
   );
 }
 
+async function scenario6ReadOpts(column) {
+  // Ensure a home timeline (scenario 2 may leave search/empty chrome briefly).
+  await timed(() => navigateColumn(column, "https://x.com/home")).catch(() => {});
+  await sleep(1200);
+  const full = await timed(() => readColumn(column, { includeText: false }));
+  if (!full.ok) {
+    return grade(false, false, `read_column failed: ${full.error}`, { full });
+  }
+  const hasTextDefault = typeof full.value.text === "string";
+  const fullCount =
+    full.value.tweetCount ??
+    (Array.isArray(full.value.tweets) ? full.value.tweets.length : 0);
+
+  const limited = await timed(() =>
+    readColumn(column, { includeText: false, limit: 2 })
+  );
+  if (!limited.ok) {
+    return grade(false, false, `read_column limit failed: ${limited.error}`, {
+      limited,
+    });
+  }
+  const limCount =
+    limited.value.tweetCount ??
+    (Array.isArray(limited.value.tweets) ? limited.value.tweets.length : 0);
+  const limLen = Array.isArray(limited.value.tweets)
+    ? limited.value.tweets.length
+    : 0;
+
+  const withText = await timed(() =>
+    readColumn(column, { includeText: true, maxChars: 200 })
+  );
+  const textOptInOk =
+    withText.ok &&
+    typeof withText.value.text === "string" &&
+    withText.value.text.length > 0 &&
+    withText.value.text.length <= 200;
+
+  const limitOk =
+    fullCount === 0
+      ? limCount === 0
+      : limCount <= 2 && limLen <= 2 && limCount <= fullCount;
+
+  const pass = !hasTextDefault && limitOk && textOptInOk;
+  const partial =
+    !pass && !hasTextDefault && (limitOk || textOptInOk);
+
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `default omits text; limit=2 → ${limCount} cards; includeText truncates`
+      : partial
+        ? `partial: noDefaultText=${!hasTextDefault} limitOk=${limitOk} textOptIn=${textOptInOk}`
+        : `failed: defaultHasText=${hasTextDefault} full=${fullCount} lim=${limCount} textOptIn=${textOptInOk}`,
+    {
+      fullCount,
+      limCount,
+      hasTextDefault,
+      textOptInOk,
+      textLen: withText.ok ? withText.value.text?.length : null,
+      fullMs: full.ms,
+      limitedMs: limited.ms,
+    }
+  );
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
@@ -642,6 +709,12 @@ async function main() {
   };
   console.error(`  5 eval_js_gated: ${report.scenarios[5].status} — ${report.scenarios[5].reason}`);
 
+  report.scenarios[6] = {
+    name: "read_column_opts",
+    ...(await scenario6ReadOpts(opts.column)),
+  };
+  console.error(`  6 read_column_opts: ${report.scenarios[6].status} — ${report.scenarios[6].reason}`);
+
   report.finishedAt = new Date().toISOString();
   report.summary = {
     1: report.scenarios[1].status,
@@ -649,6 +722,7 @@ async function main() {
     3: report.scenarios[3].status,
     4: report.scenarios[4].status,
     5: report.scenarios[5].status,
+    6: report.scenarios[6].status,
   };
 
   const out = JSON.stringify(report, null, 2);

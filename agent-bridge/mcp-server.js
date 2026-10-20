@@ -107,7 +107,14 @@ server.registerTool(
       include_text: z
         .boolean()
         .optional()
-        .describe("Include raw innerText blob (default true)"),
+        .describe("Include raw innerText blob (default false — opt-in)"),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .describe("Max tweet cards to return (server-side truncate)"),
       max_chars: z
         .number()
         .int()
@@ -117,12 +124,13 @@ server.registerTool(
     },
     annotations: READ_ONLY,
   },
-  async ({ column, include_text, max_chars }) => {
+  async ({ column, include_text, max_chars, limit }) => {
     try {
       return jsonResult(
         await readColumn(column, {
           maxChars: max_chars,
-          includeText: include_text !== false,
+          includeText: include_text === true,
+          limit,
         })
       );
     } catch (err) {

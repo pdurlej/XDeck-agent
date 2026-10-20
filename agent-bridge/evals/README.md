@@ -27,6 +27,7 @@ Or: `npm run evals`
 | 3 | Periodic poll | 2–3 `read_column` cycles (+ optional scroll/reload); stable/comparable ids; no crash |
 | 4 | Write honesty | `POST /post_tweet`, `/reply`, `/retweet` → **HTTP 501** (never actually posts) |
 | 5 | Eval gate | MCP `tools/list` omits `eval_js` by default; `POST /eval` + `/columns/0/eval` → **HTTP 404** when `XDECK_AGENT_EVAL` unset |
+| 6 | read_column opts | Default response omits raw `text`; `limit=2` truncates cards; `includeText` opt-in works |
 
 Exit code `1` if any scenario is `fail`; `partial` still exits `0`.
 
