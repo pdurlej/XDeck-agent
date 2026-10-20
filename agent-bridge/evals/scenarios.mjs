@@ -11,12 +11,13 @@
  *  5. Eval gate — MCP tools/list omits eval_js by default; HTTP POST /eval → 404
  *  6. read_column opts — default omits raw text; `limit` truncates tweet cards
  *  7. G1 metrics — feed cards expose numeric metrics.{replies,reposts,likes,views,bookmarks}
- *  8. G2 notifications — /notifications column returns typed notifications[]
+ *  8. G2/N1–N2 notifications — typed notifications[]; reply≠repost; per-cell target ids
  *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
  * 10. G4 articles — article search yields article.{title,preview} and/or media type article
  * 11. Bind listener — exactly one TCP listener on 18765 and it is 127.0.0.1 (not *)
  * 12. Bind restart — (opt-in) kill XDeck, relaunch within 5s; unauth /health → 401 within 15s
  * 13. Eval remains gated — after hasWebView ready, POST /eval → 404 body contains "Eval disabled"
+ * 14. N4 status not-found — nonexistent status fails fast (notFound, waitedMs ≪ 54s, retries 0)
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -969,10 +970,78 @@ async function scenario8Notifications(column) {
   const withTargetId = withTarget.filter(
     (e) => typeof e.target?.id === "string" && e.target.id.length > 0
   );
-  // Like/repost of own posts should expose target.id/url when possible.
+
+  // N1: reply/mention cells must not be typed as repost.
+  // Heuristic: events that look like reply/mention (actor tweet chrome, or
+  // tweets[] harvested from the same column with inReplyTo) should be reply|mention.
+  const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
+  const replyTweetHandles = new Set(
+    tweets
+      .filter((t) => t?.inReplyTo || t?.handle)
+      .map((t) => String(t.handle || "").toLowerCase())
+      .filter(Boolean)
+  );
+  const misTypedAsRepost = (events || []).filter((e) => {
+    if (e?.type !== "repost") return false;
+    // Aggregation reposts usually have actorCount≥1 and target text of *your* post,
+    // without embedding a full foreign tweet card as the only signal.
+    // Mis-typed replies often have actorCount small and target.id belonging to the actor.
+    const actorHandles = (e.actors || [])
+      .map((a) => String(a?.handle || "").toLowerCase())
+      .filter(Boolean);
+    const targetId = e.target?.id;
+    const targetIsActorTweet =
+      targetId &&
+      tweets.some(
+        (t) =>
+          t?.id === targetId &&
+          actorHandles.includes(String(t.handle || "").toLowerCase())
+      );
+    const actorAlsoInReplyTweets = actorHandles.some((h) =>
+      replyTweetHandles.has(h)
+    );
+    return Boolean(targetIsActorTweet || actorAlsoInReplyTweets);
+  });
+  const replyTypedOk = misTypedAsRepost.length === 0;
+  const hasReplyOrMention = (events || []).some(
+    (e) => e?.type === "reply" || e?.type === "mention"
+  );
+
+  // N2: when multiple targets have text, their ids must not all collapse to one
+  // neighbour id (basal bleed). Distinct texts ⇒ distinct ids when ids present.
+  const targetsWithBoth = withTarget.filter(
+    (e) =>
+      typeof e.target?.text === "string" &&
+      e.target.text.length > 0 &&
+      typeof e.target?.id === "string" &&
+      e.target.id.length > 0
+  );
+  const uniqueTexts = new Set(
+    targetsWithBoth.map((e) => e.target.text.slice(0, 80))
+  );
+  const uniqueIds = new Set(targetsWithBoth.map((e) => e.target.id));
+  // If ≥2 distinct target texts have ids, require ≥2 distinct ids (no universal basal).
+  const perCellIdsOk =
+    uniqueTexts.size < 2 || uniqueIds.size >= Math.min(2, uniqueTexts.size);
+  // Prefer null over wrong: events with text may omit id — that is OK.
+  // Fail only when ids are present and collapsed.
   const targetIdOk =
-    withTarget.length === 0 || withTargetId.length >= 1;
-  const pass = typed === true && targetIdOk;
+    withTarget.length === 0 ||
+    (withTargetId.length >= 1 && perCellIdsOk) ||
+    (withTargetId.length === 0 && withTarget.length >= 1);
+
+  const hydrateFlagsOk =
+    typeof read.value.hydrating === "boolean" &&
+    typeof read.value.stale === "boolean";
+
+  const pass =
+    typed === true &&
+    targetIdOk &&
+    perCellIdsOk &&
+    replyTypedOk &&
+    hydrateFlagsOk &&
+    // Soft: if the live column has reply-looking tweets, expect reply|mention type.
+    (!tweets.some((t) => t?.inReplyTo) || hasReplyOrMention || misTypedAsRepost.length === 0);
   const partial =
     !pass &&
     Array.isArray(events) &&
@@ -982,9 +1051,9 @@ async function scenario8Notifications(column) {
     pass,
     partial,
     pass
-      ? `notifications typed events=${events.length} targetId=${withTargetId.length}/${withTarget.length}`
+      ? `notifications typed events=${events.length} replyOk=${replyTypedOk} targetId=${withTargetId.length}/${withTarget.length} uniqueIds=${uniqueIds.size}/${uniqueTexts.size}`
       : partial
-        ? `notifications array present but weak shape/target id (n=${events?.length ?? 0} targetId=${withTargetId.length}/${withTarget.length})`
+        ? `notifications weak: replyMis=${misTypedAsRepost.length} targetId=${withTargetId.length}/${withTarget.length} perCell=${perCellIdsOk} hydrateFlags=${hydrateFlagsOk}`
         : `no notifications[] (nav ok=${nav.ok} ready=${nav.value?.ready})`,
     {
       nav: nav.ok
@@ -999,7 +1068,54 @@ async function scenario8Notifications(column) {
       types: events ? [...new Set(events.map((e) => e.type))] : null,
       withTarget: withTarget.length,
       withTargetId: withTargetId.length,
-      sample: events ? events.slice(0, 3) : null,
+      uniqueTargetTexts: uniqueTexts.size,
+      uniqueTargetIds: uniqueIds.size,
+      misTypedAsRepost: misTypedAsRepost.length,
+      hasReplyOrMention,
+      hydrating: read.value.hydrating ?? null,
+      stale: read.value.stale ?? null,
+      sample: events ? events.slice(0, 5) : null,
+    }
+  );
+}
+
+/** N4: nonexistent status must fail fast (not 2×16s retries ≈ 54s). */
+async function scenario14StatusNotFound(column) {
+  const fakeId = "1999999999999999999";
+  const url = `https://x.com/pdurlej/status/${fakeId}`;
+  const nav = await timed(() => navigateColumn(column, url));
+  if (!nav.ok) {
+    return grade(false, false, `navigate failed: ${nav.error}`, { nav });
+  }
+  const v = nav.value || {};
+  const waitedMs = typeof v.waitedMs === "number" ? v.waitedMs : nav.ms;
+  const retries = typeof v.retries === "number" ? v.retries : null;
+  const notFound = v.notFound === true;
+  // Fail-fast budget: well under the old ~54s double-retry path.
+  const fastEnough = waitedMs <= 20_000;
+  const noRetryBurn = retries === 0 || retries === null;
+  const pass = notFound && fastEnough && (v.ok === false || v.tweetCount === 0);
+  const partial =
+    !pass &&
+    (fastEnough || notFound || (typeof waitedMs === "number" && waitedMs < 40_000));
+  return grade(
+    pass,
+    partial,
+    pass
+      ? `status not-found fail-fast waitedMs=${waitedMs} retries=${retries}`
+      : partial
+        ? `partial not-found waitedMs=${waitedMs} notFound=${notFound} retries=${retries}`
+        : `slow/missing not-found waitedMs=${waitedMs} notFound=${notFound} retries=${retries}`,
+    {
+      url,
+      ok: v.ok,
+      ready: v.ready,
+      notFound,
+      retries,
+      waitedMs,
+      tweetCount: v.tweetCount,
+      method: v.method,
+      navMs: nav.ms,
     }
   );
 }
@@ -1610,6 +1726,14 @@ async function main() {
   };
   console.error(`  12 bind_restart: ${report.scenarios[12].status} — ${report.scenarios[12].reason}`);
 
+  report.scenarios[14] = {
+    name: "n4_status_not_found",
+    ...(await scenario14StatusNotFound(opts.column)),
+  };
+  console.error(
+    `  14 n4_status_not_found: ${report.scenarios[14].status} — ${report.scenarios[14].reason}`
+  );
+
   // Leave column on home for the next human/agent session (best-effort).
   await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
 
@@ -1637,6 +1761,7 @@ async function main() {
     11: report.scenarios[11].status,
     12: report.scenarios[12].status,
     13: report.scenarios[13].status,
+    14: report.scenarios[14].status,
   };
 
   const out = JSON.stringify(report, null, 2);

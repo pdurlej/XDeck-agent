@@ -657,10 +657,15 @@ final class AgentBridge: ObservableObject {
                 }
             }
         }
+        // N3: refresh card count so hydrating/stale reflect live DOM, not stale cache.
+        await ColumnRegistry.shared.refreshCardCount(column: index)
+        let hydrate = ColumnRegistry.shared.hydrateFlags(forColumn: index)
         var parts = [
             #""column":\#(index)"#,
             #""challenge":\#(challengeJSON)"#,
             #""tweets":\#(tweetsJSON)"#,
+            #""hydrating":\#(hydrate.hydrating ? "true" : "false")"#,
+            #""stale":\#(hydrate.stale ? "true" : "false")"#,
         ]
         if let notificationsJSON {
             parts.append(#""notifications":\#(notificationsJSON)"#)
@@ -743,7 +748,7 @@ final class AgentBridge: ObservableObject {
             return ""
         }()
         return (200, """
-        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs)\(repliesLoadedJSON)}
+        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs),"notFound":\(result.notFound ? "true" : "false")\(repliesLoadedJSON)}
         """)
     }
 
@@ -816,6 +821,7 @@ final class AgentBridge: ObservableObject {
             var needsHuman = false
             var visibilityState = "null"
             if col.hasWebView {
+                await ColumnRegistry.shared.refreshCardCount(column: col.index)
                 if let probed = try? await ColumnRegistry.shared.evaluateJavaScript(
                     column: col.index,
                     script: AgentDOM.challengeProbeJS
@@ -834,9 +840,11 @@ final class AgentBridge: ObservableObject {
                     visibilityState = vis
                 }
             }
+            // Re-read flags after card-count refresh.
+            let flags = ColumnRegistry.shared.hydrateFlags(forColumn: col.index)
             colParts.append(
                 """
-                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"visibilityState":\(visibilityState),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
+                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"visibilityState":\(visibilityState),"hydrating":\(flags.hydrating ? "true" : "false"),"stale":\(flags.stale ? "true" : "false"),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
                 """
             )
         }
@@ -850,7 +858,7 @@ final class AgentBridge: ObservableObject {
         let columns = ColumnRegistry.shared.snapshot()
         let cols = columns.map { col -> String in
             """
-            {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView)}
+            {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"hydrating":\(col.hydrating ? "true" : "false"),"stale":\(col.stale ? "true" : "false")}
             """
         }.joined(separator: ",")
         return #"{"columns":[\#(cols)]}"#

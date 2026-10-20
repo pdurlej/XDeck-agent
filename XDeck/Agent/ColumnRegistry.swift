@@ -12,6 +12,10 @@ final class ColumnRegistry {
         let url: String?
         let isLoading: Bool
         let hasWebView: Bool
+        /// N3: mid-load / waiting for first cards.
+        let hydrating: Bool
+        /// N3: past grace, still empty after one self-heal reload (or heal exhausted).
+        let stale: Bool
     }
 
     private struct Entry {
@@ -19,6 +23,14 @@ final class ColumnRegistry {
         weak var webView: WKWebView?
         var url: URL?
         var isLoading: Bool
+        /// When the latest navigation finished (`isLoading` → false).
+        var loadFinishedAt: Date?
+        /// True after one automatic reload for blank post-load columns.
+        var hydrateHealAttempted: Bool = false
+        /// Last observed card count (tweets or notification cells).
+        var lastCardCount: Int = 0
+        /// Scheduled self-heal task for this column (cancelled on new load).
+        var hydrateTask: Task<Void, Never>?
     }
 
     private var entries: [Int: Entry] = [:]
@@ -26,6 +38,9 @@ final class ColumnRegistry {
     private var ignoreBindingLoad: Set<ObjectIdentifier> = []
     /// Best-effort logged-in handle scraped from the profile column / login flow.
     var userHandle: String?
+
+    /// Seconds after load with zero cards before one automatic reload (N3).
+    private static let hydrateGraceSeconds: TimeInterval = 5.0
 
     private init() {}
 
@@ -44,6 +59,8 @@ final class ColumnRegistry {
         /// Status pages only: true when root + ≥1 reply/card visible after settle/scroll.
         /// False when only the root tweet rendered (common if WebView was occluded/hidden).
         let repliesLoaded: Bool?
+        /// N4: X status URL resolved to the not-found page (fail-fast, no retries).
+        let notFound: Bool
     }
 
     func shouldIgnoreBindingLoad(_ webView: WKWebView) -> Bool {
@@ -59,32 +76,156 @@ final class ColumnRegistry {
     }
 
     func register(index: Int, type: String, webView: WKWebView, url: URL?, isLoading: Bool) {
-        entries[index] = Entry(type: type, webView: webView, url: url, isLoading: isLoading)
+        entries[index]?.hydrateTask?.cancel()
+        entries[index] = Entry(
+            type: type,
+            webView: webView,
+            url: url,
+            isLoading: isLoading,
+            loadFinishedAt: isLoading ? nil : Date(),
+            hydrateHealAttempted: false,
+            lastCardCount: 0,
+            hydrateTask: nil
+        )
+        if !isLoading {
+            scheduleHydrateWatch(index: index)
+        }
     }
 
     func update(index: Int, url: URL?, isLoading: Bool?) {
         guard var entry = entries[index] else { return }
         if let url { entry.url = url }
-        if let isLoading { entry.isLoading = isLoading }
+        if let isLoading {
+            let wasLoading = entry.isLoading
+            entry.isLoading = isLoading
+            if isLoading && !wasLoading {
+                // New navigation started — cancel pending watch; keep hydrateHealAttempted
+                // so self-heal reload cannot loop forever (reset only via navigate / manual reload).
+                entry.loadFinishedAt = nil
+                entry.lastCardCount = 0
+                entry.hydrateTask?.cancel()
+                entry.hydrateTask = nil
+            } else if !isLoading && wasLoading {
+                entry.loadFinishedAt = Date()
+                entries[index] = entry
+                scheduleHydrateWatch(index: index)
+                return
+            }
+        }
         entries[index] = entry
     }
 
     func unregister(index: Int, webView: WKWebView) {
         guard let entry = entries[index], entry.webView === webView else { return }
+        entry.hydrateTask?.cancel()
         entries.removeValue(forKey: index)
     }
 
     func snapshot() -> [ColumnSnapshot] {
         entries.keys.sorted().compactMap { index in
             guard let entry = entries[index] else { return nil }
+            let flags = hydrateFlags(for: entry)
             return ColumnSnapshot(
                 index: index,
                 type: entry.type,
                 url: entry.url?.absoluteString,
                 isLoading: entry.isLoading,
-                hasWebView: entry.webView != nil
+                hasWebView: entry.webView != nil,
+                hydrating: flags.hydrating,
+                stale: flags.stale
             )
         }
+    }
+
+    /// N3 flags for a single column (also used by read_column).
+    func hydrateFlags(forColumn index: Int) -> (hydrating: Bool, stale: Bool) {
+        guard let entry = entries[index] else { return (false, false) }
+        return hydrateFlags(for: entry)
+    }
+
+    private func hydrateFlags(for entry: Entry) -> (hydrating: Bool, stale: Bool) {
+        if entry.isLoading {
+            return (true, false)
+        }
+        if entry.lastCardCount > 0 {
+            return (false, false)
+        }
+        guard let finished = entry.loadFinishedAt else {
+            // Registered but never finished a load yet.
+            return (true, false)
+        }
+        let elapsed = Date().timeIntervalSince(finished)
+        if elapsed < Self.hydrateGraceSeconds {
+            return (true, false)
+        }
+        // Past grace, still empty.
+        if entry.hydrateHealAttempted {
+            return (false, true)
+        }
+        // Grace elapsed but heal not yet run / in flight.
+        return (true, false)
+    }
+
+    /// N3: if still no cards after grace, reload once.
+    private func scheduleHydrateWatch(index: Int) {
+        entries[index]?.hydrateTask?.cancel()
+        let graceNs = UInt64(Self.hydrateGraceSeconds * 1_000_000_000)
+        entries[index]?.hydrateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: graceNs)
+            guard let self, !Task.isCancelled else { return }
+            await self.maybeSelfHealHydrate(index: index)
+        }
+    }
+
+    private func maybeSelfHealHydrate(index: Int) async {
+        guard var entry = entries[index], entry.webView != nil else { return }
+        if entry.isLoading || entry.hydrateHealAttempted { return }
+        guard entry.loadFinishedAt != nil else { return }
+        let cards = await cardCount(column: index)
+        entry.lastCardCount = cards
+        entries[index] = entry
+        if cards > 0 { return }
+        entry.hydrateHealAttempted = true
+        entries[index] = entry
+        print("[AgentBridge] hydrate self-heal reload column=\(index) (0 cards after \(Int(Self.hydrateGraceSeconds))s)")
+        do {
+            try reload(column: index, resetHydrateHeal: false)
+        } catch {
+            print("[AgentBridge] hydrate self-heal failed column=\(index): \(error.localizedDescription)")
+        }
+    }
+
+    /// Tweet cards, or notification cells when on /notifications.
+    private func cardCount(column index: Int) async -> Int {
+        let js = #"""
+        (function() {
+          var tweets = document.querySelectorAll('article[data-testid="tweet"]').length;
+          var path = String(location.pathname || '');
+          if (/\/notifications/i.test(path)) {
+            var cells = document.querySelectorAll('[data-testid="cellInnerDiv"]').length;
+            return Math.max(tweets, cells);
+          }
+          return tweets;
+        })()
+        """#
+        do {
+            let raw = try await evaluateJavaScript(column: index, script: js)
+            if let n = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return n
+            }
+            if let data = raw.data(using: .utf8),
+               let num = try? JSONSerialization.jsonObject(with: data) as? NSNumber {
+                return num.intValue
+            }
+        } catch {}
+        return 0
+    }
+
+    /// Refresh lastCardCount (call from read/health so flags stay honest).
+    func refreshCardCount(column index: Int) async {
+        guard entries[index] != nil else { return }
+        let cards = await cardCount(column: index)
+        entries[index]?.lastCardCount = cards
     }
 
     func webView(at index: Int) -> WKWebView? {
@@ -119,8 +260,12 @@ final class ColumnRegistry {
         }
         markIgnoreBindingLoad(webView)
         let cleanURL = Self.stripFailedScript(url)
+        entries[index]?.hydrateTask?.cancel()
         entries[index]?.url = cleanURL
         entries[index]?.isLoading = true
+        entries[index]?.loadFinishedAt = nil
+        entries[index]?.hydrateHealAttempted = false
+        entries[index]?.lastCardCount = 0
 
         let started = Date()
         var method = "assign"
@@ -191,54 +336,63 @@ final class ColumnRegistry {
             try await hardLoad(webView: webView, url: cleanURL)
         }
 
+        // N4: shorter first settle for status — not-found pages should surface quickly.
+        let firstSettleMs = isStatus ? min(settleTimeoutMs, 8_000) : settleTimeoutMs
         var finalProbe = await waitForPage(
             column: index,
-            timeoutMs: settleTimeoutMs,
+            timeoutMs: firstSettleMs,
             acceptSearchEmpty: isSearch,
             requireSearchHref: isSearch ? cleanURL : nil
         )
 
-        // Retry error shells: rehydrate via home hard-load, then pushState (never assign search cold).
-        // Status pages: also retry when ready=false with tweetCount=0 (SPA still hydrating).
-        while (finalProbe.errorShell ||
-                (!finalProbe.ready && (isSearch || isStatus))) && retries < 2 {
-            retries += 1
-            method = "retry-pushstate"
-            try await hardLoad(webView: webView, url: URL(string: "https://x.com/home")!)
-            let home = await waitForPage(column: index, timeoutMs: 12_000, acceptSearchEmpty: false)
-            if home.ready && !home.errorShell {
-                let soft = await attemptSoftNavigate(column: index, url: cleanURL)
-                if !soft.ok {
-                    if isSearch {
-                        let box = await attemptSoftSearch(column: index, url: cleanURL, healthy: true)
-                        if !box.ok {
+        // N4: X not-found page — fail fast, do not burn 2×16s retries.
+        if !(isStatus && finalProbe.statusNotFound) {
+            // Retry error shells: rehydrate via home hard-load, then pushState (never assign search cold).
+            // Status pages: also retry when ready=false with tweetCount=0 (SPA still hydrating).
+            while (finalProbe.errorShell ||
+                    (!finalProbe.ready && (isSearch || isStatus))) && retries < 2 {
+                retries += 1
+                method = "retry-pushstate"
+                try await hardLoad(webView: webView, url: URL(string: "https://x.com/home")!)
+                let home = await waitForPage(column: index, timeoutMs: 12_000, acceptSearchEmpty: false)
+                if home.ready && !home.errorShell {
+                    let soft = await attemptSoftNavigate(column: index, url: cleanURL)
+                    if !soft.ok {
+                        if isSearch {
+                            let box = await attemptSoftSearch(column: index, url: cleanURL, healthy: true)
+                            if !box.ok {
+                                try await hardLoad(webView: webView, url: cleanURL)
+                                method = "load-retry"
+                            } else {
+                                method = "retry-" + box.method
+                            }
+                        } else {
                             try await hardLoad(webView: webView, url: cleanURL)
                             method = "load-retry"
-                        } else {
-                            method = "retry-" + box.method
                         }
-                    } else {
-                        try await hardLoad(webView: webView, url: cleanURL)
-                        method = "load-retry"
                     }
+                } else {
+                    try await hardLoad(webView: webView, url: cleanURL)
+                    method = "load-retry"
                 }
-            } else {
-                try await hardLoad(webView: webView, url: cleanURL)
-                method = "load-retry"
+                finalProbe = await waitForPage(
+                    column: index,
+                    timeoutMs: settleTimeoutMs,
+                    acceptSearchEmpty: isSearch,
+                    requireSearchHref: isSearch ? cleanURL : nil
+                )
+                if isStatus && finalProbe.statusNotFound { break }
             }
-            finalProbe = await waitForPage(
-                column: index,
-                timeoutMs: settleTimeoutMs,
-                acceptSearchEmpty: isSearch,
-                requireSearchHref: isSearch ? cleanURL : nil
-            )
+        } else {
+            method = method == "assign" || method == "load" ? method + "+notfound" : method
+            print("[AgentBridge] status not-found fail-fast column=\(index) waitedMs=\(Int(Date().timeIntervalSince(started) * 1000)) url=\(cleanURL.absoluteString)")
         }
 
         // Status pages: conversation replies often hydrate after root. Scroll a few
         // times to harvest; if still only the root, report repliesLoaded=false
         // (WebKit may not paint replies while the window is occluded/hidden).
         var repliesLoaded: Bool? = nil
-        if isStatus && finalProbe.ready && !finalProbe.errorShell {
+        if isStatus && finalProbe.ready && !finalProbe.errorShell && !finalProbe.statusNotFound {
             if finalProbe.tweets <= 1 {
                 for _ in 0..<4 {
                     _ = try? await scroll(column: index, deltaY: 1400)
@@ -257,16 +411,20 @@ final class ColumnRegistry {
         }
 
         entries[index]?.isLoading = false
+        entries[index]?.loadFinishedAt = Date()
+        entries[index]?.lastCardCount = finalProbe.tweets
         if let live = webView.url {
             entries[index]?.url = live
         }
+        scheduleHydrateWatch(index: index)
 
         let waitedMs = Int(Date().timeIntervalSince(started) * 1000)
         if waitedMs > 10_000 {
             print("[AgentBridge] navigate slow column=\(index) waitedMs=\(waitedMs) method=\(method) tweets=\(finalProbe.tweets) url=\(cleanURL.absoluteString)")
         }
+        let notFound = isStatus && finalProbe.statusNotFound
         return NavigateResult(
-            ok: finalProbe.ready && !finalProbe.errorShell,
+            ok: finalProbe.ready && !finalProbe.errorShell && !notFound,
             column: index,
             url: cleanURL.absoluteString,
             finalURL: finalProbe.href.isEmpty ? (webView.url?.absoluteString ?? cleanURL.absoluteString) : finalProbe.href,
@@ -277,7 +435,8 @@ final class ColumnRegistry {
             challenge: finalProbe.challenge,
             retries: retries,
             waitedMs: waitedMs,
-            repliesLoaded: repliesLoaded
+            repliesLoaded: repliesLoaded,
+            notFound: notFound
         )
     }
 
@@ -287,6 +446,7 @@ final class ColumnRegistry {
         var challenge = false
         var tweets = 0
         var href = ""
+        var statusNotFound = false
     }
 
     private func pageProbe(column index: Int) async -> PageProbe {
@@ -326,6 +486,8 @@ final class ColumnRegistry {
                 }
             }
             if last.ready { return last }
+            // N4: not-found is a settled outcome — return as soon as detected.
+            if last.statusNotFound { return last }
             if acceptSearchEmpty {
                 // searchEmpty is folded into ready via pageReadyJS
             }
@@ -442,15 +604,23 @@ final class ColumnRegistry {
             errorShell: obj["errorShell"] as? Bool ?? false,
             challenge: obj["challenge"] as? Bool ?? false,
             tweets: (obj["tweets"] as? Int) ?? (obj["tweets"] as? NSNumber)?.intValue ?? 0,
-            href: obj["href"] as? String ?? ""
+            href: obj["href"] as? String ?? "",
+            statusNotFound: obj["statusNotFound"] as? Bool ?? false
         )
     }
 
-    func reload(column index: Int) throws {
+    /// - Parameter resetHydrateHeal: when true (manual/agent reload), allow another
+    ///   automatic blank-column heal. Self-heal passes false to avoid loops.
+    func reload(column index: Int, resetHydrateHeal: Bool = true) throws {
         guard let webView = entries[index]?.webView else {
             throw AgentBridgeError.columnNotFound(index)
         }
+        entries[index]?.hydrateTask?.cancel()
         entries[index]?.isLoading = true
+        entries[index]?.loadFinishedAt = nil
+        if resetHydrateHeal {
+            entries[index]?.hydrateHealAttempted = false
+        }
         webView.reload()
     }
 
