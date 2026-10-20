@@ -20,15 +20,16 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 
 1. Listens on **`127.0.0.1:18765`** (loopback; bearer token required).
 2. Holds column `WKWebView` refs and runs `evaluateJavaScript` / `load` / `reload`.
-3. Writes a bearer token (mode `0600`) to:
-   - `/Users/Shared/XDeck-agent/agent.token` (portable; Debug absolute-path exception)
-   - and best-effort `~/Library/Application Support/XDeck/agent.token`
+3. **Stable bearer token** (mode `0600`) — reused across app restarts when the file is still valid:
+   - **`/Users/Shared/XDeck-agent/agent.token`** — canonical for CLI/MCP (Debug absolute-path entitlement)
+   - Sandbox container App Support (internal) + best-effort `~/Library/Application Support/XDeck/agent.token`
+   - **Never `/tmp`.** Prefer reading the file (or `XDECK_AGENT_TOKEN_FILE`); cached `XDECK_AGENT_TOKEN` env stays valid across restarts until you rotate with `XDECK_AGENT_ROTATE_TOKEN=1`.
 4. HTTP + stdio **MCP** (`agent-bridge/`):
 
 | Tool / route | Role |
 |--------------|------|
-| `health` / `list_columns` | Session + column metadata |
-| `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`) + optional raw `text` |
+| `health` / `list_columns` | Session + column metadata; `health` includes per-column `needs_human` / `challenge` |
+| `read_column` | **Structured** tweet cards + `needs_human` when the column looks like login/CAPTCHA/error shell |
 | `navigate_column` | Load URL in a column (e.g. x.com search) |
 | `scroll_column` | Scroll timeline viewport |
 | `reload_column` | Reload WebView |

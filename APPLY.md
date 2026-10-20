@@ -66,25 +66,26 @@ cp /tmp/xdeck-bridge-sources/README.md /path/to/XDeck/
 2. Confirm Run env: `XDECK_AGENT=1`
 3. Build & run; log into x.com
 4. Toolbar should show **Agent :18765**
-5. Token: `~/Library/Application Support/XDeck/agent.token`
+5. Token (stable across restarts): `/Users/Shared/XDeck-agent/agent.token` or `~/Library/Application Support/XDeck/agent.token` (never `/tmp`)
 
 If bind fails under sandbox: confirm Debug `CODE_SIGN_ENTITLEMENTS` = `XDeck/XDeck.Debug.entitlements` (includes `network.server`), or temporarily disable App Sandbox for local Debug only. Do not change Release entitlements.
 
 ## Mac smoke curls
 
 ```sh
-TOKEN="$HOME/Library/Application Support/XDeck/agent.token"
+TOKEN=$(cat /Users/Shared/XDeck-agent/agent.token 2>/dev/null \
+  || cat "$HOME/Library/Application Support/XDeck/agent.token")
 
-curl -sS -H "Authorization: Bearer $(cat "$TOKEN")" \
+curl -sS -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:18765/health
 
-curl -sS -H "Authorization: Bearer $(cat "$TOKEN")" \
+curl -sS -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:18765/columns
 
-curl -sS -H "Authorization: Bearer $(cat "$TOKEN")" \
+curl -sS -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:18765/columns/0/text
 
-curl -sS -H "Authorization: Bearer $(cat "$TOKEN")" \
+curl -sS -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"column":0,"js":"document.title"}' \
   http://127.0.0.1:18765/eval

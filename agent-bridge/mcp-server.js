@@ -65,7 +65,7 @@ server.registerTool(
   {
     title: "XDeck bridge health",
     description:
-      "Check whether the local XDeck agent bridge is up (127.0.0.1:18765) and report user handle + column count. Requires Debug XDeck with XDECK_AGENT=1. Read-visible-column lab only — not topic search or posting.",
+      "Check whether the local XDeck agent bridge is up (127.0.0.1:18765) and report user handle + column count. Includes needs_human + challenge probes per column (login/CAPTCHA/error shell). Requires Debug XDeck with XDECK_AGENT=1. Read-visible-column lab only — not topic search or posting.",
     inputSchema: {},
     annotations: READ_ONLY,
   },
@@ -101,7 +101,7 @@ server.registerTool(
   {
     title: "Read XDeck column (structured tweets)",
     description:
-      "Read visible tweet cards from a column WebView: id, author, handle, text, time, url when parseable. Optionally include raw document.body.innerText. Only what is currently on screen — not topic search.",
+      "Read visible tweet cards from a column WebView: id, author, handle, text, time, url when parseable. Sets needs_human (+ challenge.reasons) when the column looks like login, CAPTCHA, or an SPA error shell — do not treat that as feed text. Optionally include raw document.body.innerText. Only what is currently on screen — not topic search.",
     inputSchema: {
       column: z.number().int().min(0).describe("Column index (0-based)"),
       include_text: z

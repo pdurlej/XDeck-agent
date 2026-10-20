@@ -8,7 +8,7 @@ Stdio **MCP** + CLI for the opt-in XDeck localhost agent HTTP API (`127.0.0.1:18
 ## Prerequisites
 
 1. Build/run this fork with `XDECK_AGENT=1` (Debug scheme).
-2. Token at `/Users/Shared/XDeck-agent/agent.token` (or `~/Library/Application Support/XDeck/agent.token`).
+2. Stable token (reused across restarts) at `/Users/Shared/XDeck-agent/agent.token` or `~/Library/Application Support/XDeck/agent.token`. Never `/tmp`. Re-read the file after rotate (`XDECK_AGENT_ROTATE_TOKEN=1`).
 3. Node ≥ 18.
 
 ## Install
@@ -36,9 +36,9 @@ node /absolute/path/to/XDeck-agent/agent-bridge/mcp-server.js
 
 | Tool | Notes |
 |------|--------|
-| `health` | Bridge up? |
+| `health` | Bridge up? Includes aggregate + per-column `needs_human` / `challenge` |
 | `list_columns` | Column metadata |
-| `read_column` | Tweet cards + optional raw text |
+| `read_column` | Tweet cards + optional raw text; `needs_human` on login/CAPTCHA/error shell |
 | `navigate_column` | Load URL in column |
 | `scroll_column` | Scroll timeline |
 | `reload_column` | Reload WebView |
@@ -91,5 +91,6 @@ codex mcp add xdeck-agent -- \
 | Var | Default |
 |-----|---------|
 | `XDECK_AGENT_URL` | `http://127.0.0.1:18765` |
-| `XDECK_AGENT_TOKEN` | (unset — read token file) |
+| `XDECK_AGENT_TOKEN` | (unset — read token file; file is stable across restarts unless rotated) |
 | `XDECK_AGENT_TOKEN_FILE` | overrides default search order (`/Users/Shared/XDeck-agent/agent.token`, then App Support) |
+| `XDECK_AGENT_ROTATE_TOKEN` | set on the **XDeck app** process to mint a new token on next bridge start |

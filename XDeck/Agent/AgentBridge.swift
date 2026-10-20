@@ -3,7 +3,8 @@ import Network
 import Security
 
 /// Opt-in localhost HTTP bridge for agents. Starts only when `XDECK_AGENT=1`.
-/// Binds `127.0.0.1:18765`, requires bearer token from Application Support.
+/// Binds `127.0.0.1:18765`, requires bearer token from `/Users/Shared/XDeck-agent`
+/// or Application Support (stable across restarts; never `/tmp`).
 @MainActor
 final class AgentBridge {
     static let shared = AgentBridge()
@@ -43,8 +44,16 @@ final class AgentBridge {
 
     func start(port: UInt16 = AgentBridge.defaultPort) throws {
         self.port = port
-        token = Self.makeToken()
-        tokenPath = try Self.writeTokenFile(token)
+        let loaded = try Self.loadOrCreateToken()
+        token = loaded.token
+        tokenPath = loaded.path
+        if loaded.reused {
+            print("[AgentBridge] reusing stable token from \(tokenPath?.path ?? "(unknown)")")
+            Self.writeStatus("token reused path=\(tokenPath?.path ?? "?")")
+        } else {
+            print("[AgentBridge] minted new token → \(tokenPath?.path ?? "(unknown)")")
+            Self.writeStatus("token minted path=\(tokenPath?.path ?? "?")")
+        }
 
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
@@ -79,8 +88,8 @@ final class AgentBridge {
         listener.start(queue: .main)
         self.listener = listener
         isRunning = true
-        print("[AgentBridge] token written to \(tokenPath?.path ?? "(unknown)")")
-        Self.writeStatus("started token=\(tokenPath?.path ?? "?")")
+        print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused))")
+        Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused)")
     }
 
     func stop() {
@@ -118,6 +127,51 @@ final class AgentBridge {
         return dir
     }
 
+    /// Prefer Client-facing paths first so CLI/MCP and the app agree.
+    /// Never `/tmp` — only `/Users/Shared/XDeck-agent/` + App Support.
+    nonisolated private static func tokenFileCandidates() -> [URL] {
+        var urls: [URL] = [
+            URL(fileURLWithPath: "/Users/Shared/XDeck-agent/agent.token"),
+        ]
+        if let external = try? externalSupportDirectory().appendingPathComponent("agent.token") {
+            urls.append(external)
+        }
+        if let sandboxed = try? supportDirectory().appendingPathComponent("agent.token") {
+            urls.append(sandboxed)
+        }
+        return urls
+    }
+
+    nonisolated private static func isValidToken(_ value: String) -> Bool {
+        // makeToken() → 32 bytes → 64 lowercase hex chars
+        guard value.count == 64 else { return false }
+        return value.unicodeScalars.allSatisfy { CharacterSet(charactersIn: "0123456789abcdef").contains($0) }
+    }
+
+    /// Reuse an existing well-formed token across app restarts so MCP/CLI clients
+    /// that cached `XDECK_AGENT_TOKEN` or already opened the file keep working.
+    /// Set `XDECK_AGENT_ROTATE_TOKEN=1` to force a new token.
+    private static func loadOrCreateToken() throws -> (token: String, path: URL, reused: Bool) {
+        let rotate = ProcessInfo.processInfo.environment["XDECK_AGENT_ROTATE_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let forceRotate = rotate == "1" || rotate == "true" || rotate == "yes"
+
+        if !forceRotate {
+            for url in tokenFileCandidates() {
+                guard let raw = try? String(contentsOf: url, encoding: .utf8) else { continue }
+                let existing = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard isValidToken(existing) else { continue }
+                let written = try writeTokenFile(existing)
+                return (existing, written, true)
+            }
+        }
+
+        let minted = makeToken()
+        let written = try writeTokenFile(minted)
+        return (minted, written, false)
+    }
+
     private static func writeTokenFile(_ token: String) throws -> URL {
         let url = try supportDirectory().appendingPathComponent("agent.token")
         try token.write(to: url, atomically: true, encoding: .utf8)
@@ -126,8 +180,7 @@ final class AgentBridge {
             ofItemAtPath: url.path
         )
         // Mirror outside the container so CLI/MCP can read the bearer (Debug entitlements).
-        // Prefer portable /Users/Shared (absolute-path exception) plus best-effort home App Support.
-        // Do not use /tmp.
+        // Only: /Users/Shared/XDeck-agent + external App Support. Never /tmp.
         let mirrors: [URL] = [
             URL(fileURLWithPath: "/Users/Shared/XDeck-agent/agent.token"),
             (try? externalSupportDirectory().appendingPathComponent("agent.token")).flatMap { $0 },
@@ -365,14 +418,24 @@ final class AgentBridge {
     }
 
     private func readColumnJSON(index: Int, includeText: Bool) async throws -> String {
+        let challengeJSON = try await ColumnRegistry.shared.evaluateJavaScript(
+            column: index,
+            script: AgentDOM.challengeProbeJS
+        )
         let tweetsJSON = try await ColumnRegistry.shared.evaluateJavaScript(
             column: index,
             script: AgentDOM.extractTweetsJS
         )
         var parts = [
             #""column":\#(index)"#,
+            #""challenge":\#(challengeJSON)"#,
             #""tweets":\#(tweetsJSON)"#,
         ]
+        if let challengeNeedsHuman = Self.needsHuman(fromChallengeJSON: challengeJSON) {
+            parts.append(#""needs_human":\#(challengeNeedsHuman ? "true" : "false")"#)
+        } else {
+            parts.append(#""needs_human":false"#)
+        }
         // tweetCount from parsed array length when possible
         if let data = tweetsJSON.data(using: .utf8),
            let arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
@@ -386,6 +449,15 @@ final class AgentBridge {
             parts.append(#""text":\#(textJSON)"#)
         }
         return "{\(parts.joined(separator: ","))}"
+    }
+
+    private static func needsHuman(fromChallengeJSON json: String) -> Bool? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let flag = obj["needs_human"] as? Bool else {
+            return nil
+        }
+        return flag
     }
 
     private func columnFromBody(_ obj: [String: Any], defaultColumn: Int?) throws -> Int {
@@ -465,13 +537,32 @@ final class AgentBridge {
         let columns = ColumnRegistry.shared.snapshot()
         let user = ColumnRegistry.shared.userHandle
         let userJSON = user.map { Self.jsonString($0) } ?? "null"
-        let cols = columns.map { col -> String in
-            """
-            {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView)}
-            """
-        }.joined(separator: ",")
+        var anyNeedsHuman = false
+        var colParts: [String] = []
+        for col in columns {
+            var challengeJSON = "null"
+            var needsHuman = false
+            if col.hasWebView {
+                if let probed = try? await ColumnRegistry.shared.evaluateJavaScript(
+                    column: col.index,
+                    script: AgentDOM.challengeProbeJS
+                ) {
+                    challengeJSON = probed
+                    if Self.needsHuman(fromChallengeJSON: probed) == true {
+                        needsHuman = true
+                        anyNeedsHuman = true
+                    }
+                }
+            }
+            colParts.append(
+                """
+                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
+                """
+            )
+        }
+        let cols = colParts.joined(separator: ",")
         return """
-        {"ok":true,"agent":true,"port":\(port),"user":\(userJSON),"columns":[\(cols)],"columnCount":\(columns.count)}
+        {"ok":true,"agent":true,"port":\(port),"user":\(userJSON),"needs_human":\(anyNeedsHuman ? "true" : "false"),"columns":[\(cols)],"columnCount":\(columns.count),"token_stable":true}
         """
     }
 
