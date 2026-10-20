@@ -70,18 +70,41 @@ final class AgentBridge {
 
         // Bind explicitly to 127.0.0.1. Do NOT pass `on:` when using
         // requiredLocalEndpoint (that combo historically never reached .ready
-        // under App Sandbox). Fall back to interfaceType=.loopback if needed.
+        // under App Sandbox). Constructor throw *and* NWListener `.failed`
+        // both fall back to interfaceType=.loopback — a silent `.failed` left
+        // the bridge dead on some Macs.
+        try attachListener(preferExplicitLoopback: true)
+        print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused))")
+        Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused)")
+    }
+
+    /// Prefer explicit `127.0.0.1` bind; on constructor error or `.failed`, retry
+    /// with `requiredInterfaceType = .loopback`. Never leave a `.failed` silent.
+    private func attachListener(preferExplicitLoopback: Bool) throws {
+        let port = self.port
         let listener: NWListener
         let bindMode: String
-        do {
-            listener = try Self.makeLoopbackListener(port: port)
-            bindMode = "requiredLocalEndpoint:127.0.0.1"
-        } catch {
-            print("[AgentBridge] explicit 127.0.0.1 bind failed (\(error)); falling back to requiredInterfaceType=.loopback")
-            Self.writeStatus("explicit loopback bind failed: \(error); fallback interfaceType")
+        let usedExplicit: Bool
+
+        if preferExplicitLoopback {
+            do {
+                listener = try Self.makeLoopbackListener(port: port)
+                bindMode = "requiredLocalEndpoint:127.0.0.1"
+                usedExplicit = true
+            } catch {
+                print("[AgentBridge] explicit 127.0.0.1 bind threw (\(error)); falling back to requiredInterfaceType=.loopback")
+                Self.writeStatus("explicit loopback bind threw: \(error); fallback interfaceType")
+                listener = try Self.makeInterfaceLoopbackListener(port: port)
+                bindMode = "requiredInterfaceType=.loopback"
+                usedExplicit = false
+            }
+        } else {
             listener = try Self.makeInterfaceLoopbackListener(port: port)
             bindMode = "requiredInterfaceType=.loopback"
+            usedExplicit = false
         }
+
+        self.listener?.cancel()
         listener.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
                 self?.accept(connection)
@@ -92,24 +115,47 @@ final class AgentBridge {
             case .ready:
                 print("[AgentBridge] listening on 127.0.0.1:\(port) (\(bindMode))")
                 Self.writeStatus("listening on 127.0.0.1:\(port) mode=\(bindMode)")
-            case .failed(let error):
-                print("[AgentBridge] listener failed: \(error)")
-                Self.writeStatus("listener failed: \(error)")
                 Task { @MainActor in
-                    self?.isRunning = false
+                    self?.isRunning = true
+                }
+            case .failed(let error):
+                print("[AgentBridge] listener .failed (\(bindMode)): \(error)")
+                Self.writeStatus("listener .failed mode=\(bindMode): \(error)")
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.listener?.cancel()
+                    self.listener = nil
+                    self.isRunning = false
+                    if usedExplicit {
+                        print("[AgentBridge] primary bind .failed; retrying requiredInterfaceType=.loopback")
+                        Self.writeStatus("primary .failed → fallback interfaceType=.loopback")
+                        do {
+                            try self.attachListener(preferExplicitLoopback: false)
+                        } catch {
+                            print("[AgentBridge] fallback bind also failed: \(error.localizedDescription)")
+                            Self.writeStatus("fallback bind failed: \(error)")
+                        }
+                    } else {
+                        print("[AgentBridge] fallback listener .failed; bridge not listening")
+                        Self.writeStatus("fallback .failed; bridge down: \(error)")
+                    }
                 }
             case .waiting(let error):
-                print("[AgentBridge] listener waiting: \(error)")
-                Self.writeStatus("listener waiting: \(error)")
-            default:
+                print("[AgentBridge] listener waiting (\(bindMode)): \(error)")
+                Self.writeStatus("listener waiting mode=\(bindMode): \(error)")
+            case .setup:
+                break
+            case .cancelled:
+                print("[AgentBridge] listener cancelled (\(bindMode))")
+            @unknown default:
                 break
             }
         }
         listener.start(queue: .main)
         self.listener = listener
         isRunning = true
-        print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused)) bind=\(bindMode)")
-        Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused) bind=\(bindMode)")
+        print("[AgentBridge] bind=\(bindMode) (awaiting .ready)")
+        Self.writeStatus("bind=\(bindMode) awaiting .ready")
     }
 
     /// Explicit IPv4 loopback via `requiredLocalEndpoint` (no `on:` port).

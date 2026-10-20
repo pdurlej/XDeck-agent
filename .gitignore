@@ -21,3 +21,7 @@ agent-bridge/node_modules/
 **/agent-bridge.log
 .DS_Store
 DerivedData/
+
+# Local xcodebuild -derivedDataPath (Debug agent builds)
+.derivedData/
+DerivedData-bind/
