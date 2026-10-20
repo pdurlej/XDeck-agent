@@ -11,7 +11,8 @@
   "scripts": {
     "mcp": "node mcp-server.js",
     "cli": "node cli.js",
-    "smoke": "node scripts/smoke-mcp.mjs"
+    "smoke": "node scripts/smoke-mcp.mjs",
+    "evals": "node evals/scenarios.mjs"
   },
   "engines": {
     "node": ">=18"
