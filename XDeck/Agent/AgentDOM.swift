@@ -439,44 +439,106 @@ enum AgentDOM {
           if (!(scope === node || scope.contains(node))) return true;
           return false;
         }
-        // Prefer split lines from the article block (badge / title / preview).
-        var blockText = visibleText(scope);
-        var lines = blockText.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
+        function cleanArticleLine(t) {
+          if (!t) return '';
+          t = String(t).replace(/^(Artykuł|Article)\s*/i, '').trim();
+          if (/^(Artykuł|Article)$/i.test(t)) return '';
+          return t;
+        }
+        /** Title = heading element only; preview = next block (never glued heading+body). */
         var title = null;
         var preview = null;
-        for (var li = 0; li < lines.length; li++) {
-          var line = lines[li];
-          if (/^(Artykuł|Article)$/i.test(line)) continue;
-          // Badge sometimes concatenates: "ArtykułHow to write…"
-          line = line.replace(/^(Artykuł|Article)\s*/i, '').trim();
-          if (!line || line.length < 4) continue;
-          if (!title) { title = line; continue; }
-          if (!preview && line !== title) { preview = line; break; }
-        }
-        // Fallback: leaf nodes inside scope (still excluding tweet/user chrome)
-        if (!title) {
-          var bits = [];
-          var texts = scope.querySelectorAll('[dir="ltr"], span, a, div');
-          for (var j = 0; j < texts.length; j++) {
-            var el = texts[j];
-            if (excluded(el)) continue;
-            if (el.children && el.children.length > 4) continue;
-            var ct = visibleText(el);
-            if (!ct || ct.length < 8 || ct.length > 280) continue;
-            if (/^(Artykuł|Article|From|Od)$/i.test(ct)) continue;
-            if (ct.indexOf('http') === 0 || /^@/.test(ct)) continue;
-            if (bits.indexOf(ct) < 0) bits.push(ct);
-            if (bits.length >= 4) break;
+        var titleEl = null;
+        // 1) Explicit heading
+        var heading = scope.querySelector('[role="heading"], h1, h2, h3');
+        if (heading && !excluded(heading)) {
+          var ht = cleanArticleLine(visibleText(heading));
+          if (ht && ht.length >= 4 && ht.length < 150) {
+            title = ht;
+            titleEl = heading;
           }
-          if (bits.length) title = bits[0];
-          if (bits.length > 1) preview = bits[1];
         }
-        // Guard: title must not equal author/handle chrome
+        // 2) First leaf-ish block after badge/cover with length < 150
+        if (!title) {
+          var nodes = scope.querySelectorAll('span, div, a, p, h1, h2, h3');
+          for (var j = 0; j < nodes.length; j++) {
+            var el = nodes[j];
+            if (excluded(el)) continue;
+            var tid = el.getAttribute('data-testid') || '';
+            if (tid === 'article-cover-image') continue;
+            var ct = cleanArticleLine(visibleText(el));
+            if (!ct || ct.length < 8) continue;
+            // Skip containers that glue heading+body into one string (>149)
+            // — descend into children instead.
+            if (ct.length >= 150) {
+              var split = [];
+              for (var c = 0; c < el.children.length; c++) {
+                var ch = el.children[c];
+                if (excluded(ch)) continue;
+                var cht = cleanArticleLine(visibleText(ch));
+                if (cht && cht.length >= 4) split.push({ el: ch, text: cht });
+              }
+              if (split.length >= 1 && split[0].text.length < 150) {
+                title = split[0].text;
+                titleEl = split[0].el;
+                if (split.length >= 2) preview = split[1].text;
+                break;
+              }
+              continue;
+            }
+            // Leaf-ish: don't pick a wrapper whose only job is nesting
+            if (el.children && el.children.length > 2) {
+              var onlyBadge = true;
+              for (var k = 0; k < el.children.length; k++) {
+                var kt = cleanArticleLine(visibleText(el.children[k]));
+                if (kt && kt.length >= 8 && kt !== ct) { onlyBadge = false; break; }
+              }
+              if (!onlyBadge && el.children.length > 2) continue;
+            }
+            title = ct;
+            titleEl = el;
+            break;
+          }
+        }
+        // 3) Preview = next distinct block after the heading element
+        if (title && !preview && titleEl) {
+          var sib = titleEl.nextElementSibling;
+          while (sib) {
+            if (!excluded(sib)) {
+              var st = cleanArticleLine(visibleText(sib));
+              if (st && st !== title && st.length >= 4) { preview = st; break; }
+            }
+            sib = sib.nextElementSibling;
+          }
+          if (!preview) {
+            // Walk parent’s next children after titleEl
+            var par = titleEl.parentElement;
+            while (!preview && par && scope.contains(par)) {
+              var after = false;
+              for (var s = 0; s < par.children.length; s++) {
+                var kid = par.children[s];
+                if (kid === titleEl || kid.contains(titleEl)) { after = true; continue; }
+                if (!after) continue;
+                if (excluded(kid)) continue;
+                var pt2 = cleanArticleLine(visibleText(kid));
+                if (pt2 && pt2 !== title && pt2.length >= 4) { preview = pt2; break; }
+              }
+              if (preview) break;
+              if (par === scope) break;
+              par = par.parentElement;
+            }
+          }
+        }
+        // Guard: reject glued titles (heading+body without separator)
+        if (title && title.length >= 150) {
+          title = null;
+          preview = null;
+        }
         if (title) {
           for (var u2 = 0; u2 < userNameEls.length; u2++) {
             var un = visibleText(userNameEls[u2]);
             if (un && (title === un || un.indexOf(title) === 0 || title.indexOf(un.split('\n')[0]) === 0)) {
-              title = preview; preview = null; break;
+              title = null; preview = null; break;
             }
           }
         }
@@ -974,19 +1036,48 @@ enum AgentDOM {
         """
     }
 
+    /// Visible page text with script/style/noscript/template stripped.
+    /// When `visibilityState=hidden`, `innerText` is empty — fall back to a
+    /// clone with non-content tags removed so we never dump `__INITIAL_STATE__`.
     static func innerTextJS(maxChars: Int) -> String {
         """
         (function() {
           var body = document.body;
           if (!body) return '';
-          var t = document.visibilityState === 'hidden'
-            ? (body.textContent || '')
-            : (body.innerText || body.textContent || '');
+          function readableText(root) {
+            if (!root) return '';
+            try {
+              var clone = root.cloneNode(true);
+              var kill = clone.querySelectorAll('script,style,noscript,template');
+              for (var i = 0; i < kill.length; i++) {
+                var n = kill[i];
+                if (n && n.parentNode) n.parentNode.removeChild(n);
+              }
+              // Prefer innerText on the clone (layout-ish); fall back to textContent.
+              var t = (clone.innerText || clone.textContent || '');
+              return String(t).replace(/\\u00a0/g, ' ').trim();
+            } catch (e) {
+              return '';
+            }
+          }
+          var t = '';
+          if (document.visibilityState !== 'hidden') {
+            t = (body.innerText || '').trim();
+          }
+          // Hidden WebView (or empty innerText): strip scripts then read.
+          if (!t) t = readableText(body);
           if (t.length > \(maxChars)) t = t.slice(0, \(maxChars));
           return t;
         })()
         """
     }
+
+    /// Per-column `document.visibilityState` for /health.
+    static let visibilityStateJS = #"""
+    (function() {
+      return String(document.visibilityState || 'unknown');
+    })()
+    """#
 
     /// Detect login / CAPTCHA / challenge / SPA error shells so agents can set needs_human
     /// instead of treating chrome mush as a timeline.

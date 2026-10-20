@@ -716,6 +716,7 @@ final class AgentBridge {
         for col in columns {
             var challengeJSON = "null"
             var needsHuman = false
+            var visibilityState = "null"
             if col.hasWebView {
                 if let probed = try? await ColumnRegistry.shared.evaluateJavaScript(
                     column: col.index,
@@ -727,10 +728,17 @@ final class AgentBridge {
                         anyNeedsHuman = true
                     }
                 }
+                if let vis = try? await ColumnRegistry.shared.evaluateJavaScript(
+                    column: col.index,
+                    script: AgentDOM.visibilityStateJS
+                ) {
+                    // evaluateJavaScript stringifies JS strings with quotes already
+                    visibilityState = vis
+                }
             }
             colParts.append(
                 """
-                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
+                {"index":\(col.index),"type":\(Self.jsonString(col.type)),"url":\(col.url.map(Self.jsonString) ?? "null"),"isLoading":\(col.isLoading),"hasWebView":\(col.hasWebView),"visibilityState":\(visibilityState),"needs_human":\(needsHuman ? "true" : "false"),"challenge":\(challengeJSON)}
                 """
             )
         }
