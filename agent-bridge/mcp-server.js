@@ -136,7 +136,7 @@ server.registerTool(
   {
     title: "Navigate column URL",
     description:
-      "Load an http(s) URL in a column WKWebView (e.g. https://x.com/search?q=openrig&src=typed_query). Does not post. Wait for load then call read_column.",
+      "Navigate a column to an http(s) URL (e.g. https://x.com/search?q=openrig&src=typed_query&f=live). Prefers in-SPA search-box submit, waits for tweets/ready, retries SPA error shells. Returns ok/ready/tweetCount/method/waitedMs. Then call read_column.",
     inputSchema: {
       column: z.number().int().min(0).describe("Column index (0-based)"),
       url: z.string().url().describe("Absolute http(s) URL to load"),

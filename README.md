@@ -29,8 +29,8 @@ When Debug XDeck runs with `XDECK_AGENT=1`:
 | Tool / route | Role |
 |--------------|------|
 | `health` / `list_columns` | Session + column metadata; `health` includes per-column `needs_human` / `challenge` |
-| `read_column` | **Structured** tweet cards + `needs_human` when the column looks like login/CAPTCHA/error shell |
-| `navigate_column` | Load URL in a column (e.g. x.com search) |
+| `read_column` | **Structured** tweet cards (`id`, `author`, `handle`, `text`, `time`, `url`) + `needs_human` on login/CAPTCHA/error shell |
+| `navigate_column` | SPA-safe navigate (pushState / search-box); waits for search tweets / retries error shells |
 | `scroll_column` | Scroll timeline viewport |
 | `reload_column` | Reload WebView |
 | `eval_js` | Escape hatch — **not** read-only; can mutate the SPA |

@@ -55,26 +55,44 @@ struct WebViewConfigurations {
     }
 
     private static let global: String = """
-        window.onerror = function(msg, url, line, column, error) {
-            const message = JSON.stringify({ type: "debug", body: `❌️ ${msg}` });
-            webkit.messageHandlers.\(Self.handlerName).postMessage(message);
-        };
-        window.console.error = function(msg) {
-            const message = JSON.stringify({ type: "debug", body: `❌️ ${msg}` });
-            webkit.messageHandlers.\(Self.handlerName).postMessage(message);
-        };
-        window.console.warn = function(msg) {
-            const message = JSON.stringify({ type: "debug", body: `⚠️ ${msg}` });
-            webkit.messageHandlers.\(Self.handlerName).postMessage(message);
-        };
-        window.console.info = function(msg) {
-            const message = JSON.stringify({ type: "debug", body: `ℹ️ ${msg}` });
-            webkit.messageHandlers.\(Self.handlerName).postMessage(message);
-        };
-        window.console.log = function(msg) {
-            const message = JSON.stringify({ type: "debug", body: `ℹ️ ${msg}` });
-            webkit.messageHandlers.\(Self.handlerName).postMessage(message);
-        };
+        // Bridge debug hooks must never throw — x.com treats user-script exceptions as
+        // `?failedScript=` SPA error shells (Try again). Keep originals intact.
+        (function() {
+            function bridgeLog(prefix, args) {
+                try {
+                    const raw = Array.prototype.slice.call(args).map(function(v) {
+                        try { return typeof v === 'string' ? v : JSON.stringify(v); }
+                        catch (_) { return String(v); }
+                    }).join(' ').slice(0, 800);
+                    const message = JSON.stringify({ type: "debug", body: prefix + " " + raw });
+                    webkit.messageHandlers.\(Self.handlerName).postMessage(message);
+                } catch (_) {}
+            }
+            window.onerror = function(msg, url, line, column, error) {
+                bridgeLog("❌️", [msg, url, line, column]);
+                return false;
+            };
+            const c = window.console;
+            if (c) {
+                const levels = [
+                    ["error", "❌️"],
+                    ["warn", "⚠️"],
+                    ["info", "ℹ️"],
+                    ["log", "ℹ️"]
+                ];
+                levels.forEach(function(pair) {
+                    const name = pair[0];
+                    const prefix = pair[1];
+                    const original = c[name] && c[name].bind ? c[name].bind(c) : null;
+                    c[name] = function() {
+                        bridgeLog(prefix, arguments);
+                        if (original) {
+                            try { return original.apply(c, arguments); } catch (_) {}
+                        }
+                    };
+                });
+            }
+        })();
 
         \(getElementsByXPath)
 
@@ -85,7 +103,7 @@ struct WebViewConfigurations {
         const style = document.createElement('style');
         style.type = 'text/css';
         style.innerHTML = "div:has(> main):has(> :nth-child(4)) > main div:has(> div > div[role='progressbar']) { display: none; }";
-        document.querySelector('head').appendChild(style);
+        (document.head || document.documentElement).appendChild(style);
     """
 
     private static let findUserName: String = """
@@ -125,18 +143,22 @@ struct WebViewConfigurations {
     private static let hideSideHeader: String = """
         const style = document.createElement('style');
         style.type = 'text/css';
+        style.id = 'xdeck-hide-side-header';
         style.innerHTML = "header { display: none !important; }";
-        document.querySelector('head').appendChild(style);
+        (document.head || document.documentElement).appendChild(style);
         """
 
     private static let clickForYouTab: String = """
         waitForElement("a[href='/home'][role='tab']", 0, (element) => {
+            // Only on the home timeline — clicking For You after agent search nav undoes it.
+            if (location.pathname !== '/home' && location.pathname !== '/') return;
             element.click();
         });
         """
 
     private static let clickFollowingTab: String = """
         waitForElement("a[href='/home'][role='tab']", 1, (element) => {
+            if (location.pathname !== '/home' && location.pathname !== '/') return;
             element.click();
         });
         """
@@ -158,16 +180,28 @@ struct WebViewConfigurations {
 
     private static let waitForElement: String = """
         function waitForElement(selector, index, callback, once=true) {
-            const observer = new MutationObserver((mutationsList, observer) => {
-                const element = document.querySelectorAll(selector)[index];
-                if (element) {
-                    callback(element);
-                    if (once) {
-                        observer.disconnect();
-                    }
+            const start = () => {
+                if (!document.body) {
+                    setTimeout(start, 50);
+                    return;
                 }
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
+                const existing = document.querySelectorAll(selector)[index];
+                if (existing) {
+                    try { callback(existing); } catch (_) {}
+                    if (once) return;
+                }
+                const observer = new MutationObserver((mutationsList, observer) => {
+                    const element = document.querySelectorAll(selector)[index];
+                    if (element) {
+                        try { callback(element); } catch (_) {}
+                        if (once) {
+                            observer.disconnect();
+                        }
+                    }
+                });
+                observer.observe(document.body, { childList: true, subtree: true });
+            };
+            start();
         }
         """
 
@@ -206,17 +240,17 @@ struct WebViewConfigurations {
             hideAdsTimer = setTimeout(hideAds, 100);
           });
 
-          observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-          });
-
-          window.hideAdsMutationObserver = observer;
+          if (document.body) {
+            observer.observe(document.body, {
+              childList: true,
+              subtree: true,
+            });
+            window.hideAdsMutationObserver = observer;
+          }
         }
 
-        hideAds();
+        try { hideAds(); } catch (_) {}
         """
-
     static let showAds: String = """
         (() => {
           if (window.hideAdsMutationObserver) {

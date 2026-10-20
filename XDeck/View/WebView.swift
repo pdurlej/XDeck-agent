@@ -52,11 +52,20 @@ struct WebView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         if url != context.coordinator.lastUrl {
-            let request = URLRequest(url: url)
-            context.coordinator.lastUrl = url
-            webView.load(request)
+            // Agent navigate owns this WebView's location (and forYou/following share $homeUrl).
+            // Absorb binding changes without WKWebView.load — otherwise siblings fight SPA nav.
+            if ColumnRegistry.shared.shouldIgnoreBindingLoad(webView) {
+                context.coordinator.lastUrl = url
+            } else if webView.url?.absoluteString == url.absoluteString {
+                context.coordinator.lastUrl = url
+            } else {
+                let request = URLRequest(url: url)
+                context.coordinator.lastUrl = url
+                webView.load(request)
+            }
         }
         if refreshSwitch != context.coordinator.refreshSwitch {
+            ColumnRegistry.shared.clearIgnoreBindingLoad(webView)
             let request = URLRequest(url: url)
             webView.load(request)
             context.coordinator.refreshSwitch = refreshSwitch
@@ -70,7 +79,10 @@ struct WebView: NSViewRepresentable {
 
         if let columnIndex {
             Task { @MainActor in
-                ColumnRegistry.shared.update(index: columnIndex, url: url, isLoading: isLoading)
+                // Prefer live WKWebView URL while agent owns navigation.
+                let liveURL = ColumnRegistry.shared.shouldIgnoreBindingLoad(webView)
+                    ? (webView.url ?? url) : url
+                ColumnRegistry.shared.update(index: columnIndex, url: liveURL, isLoading: isLoading)
             }
         }
     }
@@ -114,10 +126,13 @@ class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         owner.isLoading = false
-        // Keep SwiftUI binding / lastUrl in sync when agent navigates via WKWebView.load.
         if let finished = webView.url {
-            owner.url = finished
             lastUrl = finished
+            // Agent-driven nav must not write back into shared bindings (forYou+following
+            // both use $homeUrl) — that forced sibling columns onto search and raced loads.
+            if !ColumnRegistry.shared.shouldIgnoreBindingLoad(webView) {
+                owner.url = finished
+            }
         }
         if let columnIndex = owner.columnIndex {
             Task { @MainActor in
