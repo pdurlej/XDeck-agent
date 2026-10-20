@@ -644,6 +644,8 @@ function metricSample(tweets) {
   const keys = ["replies", "reposts", "likes", "views", "bookmarks"];
   let withAny = 0;
   let numericOk = 0;
+  let bookmarksNull = 0;
+  let bookmarksZero = 0;
   const sample = [];
   for (const t of tweets) {
     const m = t?.metrics;
@@ -655,11 +657,13 @@ function metricSample(tweets) {
       if (typeof m[k] !== "number" || !Number.isFinite(m[k])) allNum = false;
     }
     if (allNum) numericOk++;
+    if (m.bookmarks === null) bookmarksNull++;
+    if (m.bookmarks === 0) bookmarksZero++;
     if (sample.length < 3) {
       sample.push({ id: t.id, handle: t.handle, metrics: m });
     }
   }
-  return { withAny, numericOk, sample };
+  return { withAny, numericOk, bookmarksNull, bookmarksZero, sample };
 }
 
 async function scenario7Metrics(column) {
@@ -670,18 +674,31 @@ async function scenario7Metrics(column) {
     return grade(false, false, `read_column failed: ${read.error}`, { read });
   }
   const tweets = Array.isArray(read.value.tweets) ? read.value.tweets : [];
-  const { withAny, numericOk, sample } = metricSample(tweets);
-  const pass = withAny >= 1 && numericOk >= 1;
-  const partial = !pass && tweets.length >= 1;
+  const { withAny, numericOk, bookmarksNull, bookmarksZero, sample } =
+    metricSample(tweets);
+  // Bug regression: inventing bookmarks:0 on every card when count isn't shown.
+  const bookmarksHonest =
+    withAny === 0 ||
+    bookmarksNull >= 1 ||
+    bookmarksZero < withAny; // not EVERY card forced to 0
+  const pass = withAny >= 1 && numericOk >= 1 && bookmarksHonest;
+  const partial = !pass && tweets.length >= 1 && withAny >= 1;
   return grade(
     pass,
     partial,
     pass
-      ? `metrics on ${withAny}/${tweets.length} cards (numeric=${numericOk})`
+      ? `metrics on ${withAny}/${tweets.length} cards (bookmarks null=${bookmarksNull} zero=${bookmarksZero})`
       : partial
-        ? `tweets present but no metrics objects (${tweets.length} cards)`
+        ? `metrics weak / bookmarks honesty fail (null=${bookmarksNull} zero=${bookmarksZero}/${withAny})`
         : "no tweets and no metrics",
-    { tweetCount: tweets.length, withAny, numericOk, sample }
+    {
+      tweetCount: tweets.length,
+      withAny,
+      numericOk,
+      bookmarksNull,
+      bookmarksZero,
+      sample,
+    }
   );
 }
 
@@ -716,7 +733,16 @@ async function scenario8Notifications(column) {
         Array.isArray(e.actors) &&
         typeof e.actorCount === "number"
     );
-  const pass = typed === true;
+  const withTarget = (events || []).filter(
+    (e) => e?.target && (e.target.text || e.target.id)
+  );
+  const withTargetId = withTarget.filter(
+    (e) => typeof e.target?.id === "string" && e.target.id.length > 0
+  );
+  // Like/repost of own posts should expose target.id/url when possible.
+  const targetIdOk =
+    withTarget.length === 0 || withTargetId.length >= 1;
+  const pass = typed === true && targetIdOk;
   const partial =
     !pass &&
     Array.isArray(events) &&
@@ -726,9 +752,9 @@ async function scenario8Notifications(column) {
     pass,
     partial,
     pass
-      ? `notifications typed events=${events.length}`
+      ? `notifications typed events=${events.length} targetId=${withTargetId.length}/${withTarget.length}`
       : partial
-        ? `notifications array present but weak shape (n=${events?.length ?? 0})`
+        ? `notifications array present but weak shape/target id (n=${events?.length ?? 0} targetId=${withTargetId.length}/${withTarget.length})`
         : `no notifications[] (nav ok=${nav.ok} ready=${nav.value?.ready})`,
     {
       nav: nav.ok
@@ -741,6 +767,8 @@ async function scenario8Notifications(column) {
         : nav,
       notificationCount: read.value.notificationCount ?? events?.length ?? null,
       types: events ? [...new Set(events.map((e) => e.type))] : null,
+      withTarget: withTarget.length,
+      withTargetId: withTargetId.length,
       sample: events ? events.slice(0, 3) : null,
     }
   );
@@ -843,10 +871,11 @@ async function scenario9StatusAd(column) {
 
 async function scenario10Articles(column) {
   // Avoid q=Article alone — search highlights false-positive the Article badge.
+  // Include the review query that previously grabbed author/tweet as title.
   const urls = [
+    `https://x.com/search?q=${encodeURIComponent('"claude opus" filter:links -filter:replies min_retweets:50')}&src=typed_query&f=live`,
     `https://x.com/search?q=${encodeURIComponent("url:x.com/i/article")}&src=typed_query&f=live`,
     `https://x.com/search?q=${encodeURIComponent('"Artykuł" filter:links')}&src=typed_query&f=live`,
-    `https://x.com/search?q=${encodeURIComponent("from:X filter:has_engagement min_faves:50")}&src=typed_query&f=live`,
   ];
   let best = { withArticle: 0, tweets: [], nav: null, read: null };
   for (const url of urls) {

@@ -41,6 +41,9 @@ final class ColumnRegistry {
         let challenge: Bool
         let retries: Int
         let waitedMs: Int
+        /// Status pages only: true when root + ≥1 reply/card visible after settle/scroll.
+        /// False when only the root tweet rendered (common if WebView was occluded/hidden).
+        let repliesLoaded: Bool?
     }
 
     func shouldIgnoreBindingLoad(_ webView: WKWebView) -> Bool {
@@ -231,6 +234,28 @@ final class ColumnRegistry {
             )
         }
 
+        // Status pages: conversation replies often hydrate after root. Scroll a few
+        // times to harvest; if still only the root, report repliesLoaded=false
+        // (WebKit may not paint replies while the window is occluded/hidden).
+        var repliesLoaded: Bool? = nil
+        if isStatus && finalProbe.ready && !finalProbe.errorShell {
+            if finalProbe.tweets <= 1 {
+                for _ in 0..<4 {
+                    _ = try? await scroll(column: index, deltaY: 1400)
+                    try? await Task.sleep(nanoseconds: 700_000_000)
+                    let again = await pageProbe(column: index)
+                    if again.tweets > finalProbe.tweets {
+                        finalProbe = again
+                    }
+                    if finalProbe.tweets > 1 { break }
+                }
+            }
+            repliesLoaded = finalProbe.tweets > 1
+            if repliesLoaded == false {
+                print("[AgentBridge] status replies not loaded column=\(index) tweets=\(finalProbe.tweets) url=\(cleanURL.absoluteString) — window may be hidden/occluded; bring XDeck forward and re-read/scroll")
+            }
+        }
+
         entries[index]?.isLoading = false
         if let live = webView.url {
             entries[index]?.url = live
@@ -251,7 +276,8 @@ final class ColumnRegistry {
             errorShell: finalProbe.errorShell,
             challenge: finalProbe.challenge,
             retries: retries,
-            waitedMs: waitedMs
+            waitedMs: waitedMs,
+            repliesLoaded: repliesLoaded
         )
     }
 

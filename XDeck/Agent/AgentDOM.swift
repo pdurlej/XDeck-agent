@@ -66,12 +66,19 @@ enum AgentDOM {
         return parseCount(visibleText(el));
       }
       function detectMetrics(article) {
-        var metrics = {};
+        // Always emit the five keys; unknown (control missing or no count in
+        // aria/label) is JSON null — never invent 0 for hidden bookmark counts.
+        var metrics = {
+          replies: null,
+          reposts: null,
+          likes: null,
+          views: null,
+          bookmarks: null
+        };
         function setKey(key, el) {
           if (!el) return;
           var n = countFromControl(el);
-          // Control present → always emit a number (0 when aria has no count).
-          metrics[key] = n != null ? n : 0;
+          metrics[key] = n != null ? n : null;
         }
         setKey('replies', article.querySelector('[data-testid="reply"]'));
         setKey('reposts', article.querySelector('[data-testid="retweet"]'));
@@ -82,9 +89,9 @@ enum AgentDOM {
         var analytics = article.querySelector('a[href*="/analytics"]');
         if (analytics) {
           var v = countFromControl(analytics);
-          metrics.views = v != null ? v : 0;
+          metrics.views = v != null ? v : null;
         }
-        if (!('views' in metrics)) {
+        if (metrics.views == null) {
           // Some builds put view count on a role=link without /analytics yet.
           var candidates = article.querySelectorAll('a[aria-label], div[aria-label], span[aria-label]');
           for (var i = 0; i < candidates.length; i++) {
@@ -96,10 +103,15 @@ enum AgentDOM {
             }
           }
         }
-        return Object.keys(metrics).length ? metrics : null;
+        var any = false;
+        for (var k in metrics) {
+          if (metrics[k] != null) { any = true; break; }
+        }
+        return any ? metrics : null;
       }
-      /** X Article badge only — exact leaf text, prefer near card.wrapper. */
+      /** X Article signal: exact Article/Artykuł badge and/or /i/article/ link. */
       function hasArticleLabel(article) {
+        if (article.querySelector('a[href*="/i/article/"]')) return true;
         var card = article.querySelector('[data-testid="card.wrapper"]');
         var scopes = card ? [card] : [];
         scopes.push(article);
@@ -371,49 +383,107 @@ enum AgentDOM {
       }
       /**
        * X Articles: long-form cards labeled Article/Artykuł with title/preview
-       * and often empty tweetText.
+       * and often empty tweetText. Title/preview MUST come from the article
+       * card element only — never author header or tweetText.
        */
       function detectArticle(article) {
-        var label = hasArticleLabel(article) ? 'Article' : null;
-        var card = article.querySelector('[data-testid="card.wrapper"]') ||
-          article.querySelector('[data-testid="card.layoutLarge.media"]') ||
-          article.querySelector('[data-testid="card.layoutSmall.media"]');
-        // Require Article/Artykuł label — card.wrapper alone is ordinary link cards/ads.
-        if (!label) return null;
-        // Title: prefer large card heading / bold line near Article label
+        if (!hasArticleLabel(article)) return null;
+        // X Articles today: data-testid=article-cover-image (+ Artykuł/Article badge).
+        // Older link cards: card.wrapper. Never use author header / tweetText.
+        var cover = article.querySelector('[data-testid="article-cover-image"]');
+        var card = article.querySelector('[data-testid="card.wrapper"]');
+        var detail = card && (
+          card.querySelector('[data-testid="card.layoutLarge.detail"]') ||
+          card.querySelector('[data-testid="card.layoutSmall.detail"]') ||
+          card.querySelector('[data-testid="card.layoutLarge"]') ||
+          card.querySelector('[data-testid="card.layoutSmall"]')
+        );
+        var scope = detail || card;
+        var tweetTextElEarly = article.querySelector('[data-testid="tweetText"]');
+        var userNameEarly = article.querySelector('[data-testid="User-Name"]');
+        if (!scope && cover) {
+          // Walk up from cover until badge + title are visible — stop before
+          // swallowing tweetText / User-Name (that caused author/tweet-as-title).
+          scope = cover;
+          for (var d = 0; d < 6 && scope && scope.parentElement; d++) {
+            var par = scope.parentElement;
+            if (tweetTextElEarly && par.contains(tweetTextElEarly)) break;
+            if (userNameEarly && par.contains(userNameEarly)) break;
+            var pt = visibleText(par);
+            if (pt && /(?:Artykuł|Article)/i.test(pt) && pt.length > 20 && pt.length < 900) {
+              scope = par;
+              // Prefer the smallest container that has a non-badge line
+              var plines = pt.split('\n').map(function(s) { return s.trim(); }).filter(Boolean)
+                .filter(function(s) { return !/^(Artykuł|Article)$/i.test(s); });
+              if (plines.length >= 1) break;
+            } else {
+              scope = par;
+            }
+          }
+        }
+        if (!scope) {
+          var articleLink = article.querySelector('a[href*="/i/article/"]');
+          if (articleLink) {
+            scope = articleLink.closest('[data-testid="card.wrapper"]') || articleLink.parentElement;
+          }
+        }
+        if (!scope) return null;
+        var tweetTextEl = article.querySelector('[data-testid="tweetText"]');
+        var userNameEls = article.querySelectorAll('[data-testid="User-Name"]');
+        function excluded(node) {
+          if (!node) return true;
+          if (tweetTextEl && (tweetTextEl === node || tweetTextEl.contains(node))) return true;
+          for (var u = 0; u < userNameEls.length; u++) {
+            if (userNameEls[u] === node || userNameEls[u].contains(node)) return true;
+          }
+          if (!(scope === node || scope.contains(node))) return true;
+          return false;
+        }
+        // Prefer split lines from the article block (badge / title / preview).
+        var blockText = visibleText(scope);
+        var lines = blockText.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
         var title = null;
         var preview = null;
-        if (card) {
+        for (var li = 0; li < lines.length; li++) {
+          var line = lines[li];
+          if (/^(Artykuł|Article)$/i.test(line)) continue;
+          // Badge sometimes concatenates: "ArtykułHow to write…"
+          line = line.replace(/^(Artykuł|Article)\s*/i, '').trim();
+          if (!line || line.length < 4) continue;
+          if (!title) { title = line; continue; }
+          if (!preview && line !== title) { preview = line; break; }
+        }
+        // Fallback: leaf nodes inside scope (still excluding tweet/user chrome)
+        if (!title) {
           var bits = [];
-          var texts = card.querySelectorAll('[dir="ltr"], span, a');
+          var texts = scope.querySelectorAll('[dir="ltr"], span, a, div');
           for (var j = 0; j < texts.length; j++) {
-            var ct = visibleText(texts[j]);
-            if (!ct || ct.length < 3) continue;
+            var el = texts[j];
+            if (excluded(el)) continue;
+            if (el.children && el.children.length > 4) continue;
+            var ct = visibleText(el);
+            if (!ct || ct.length < 8 || ct.length > 280) continue;
             if (/^(Artykuł|Article|From|Od)$/i.test(ct)) continue;
-            if (ct.indexOf('http') === 0) continue;
-            if (bits.indexOf(ct) >= 0) continue;
-            if (ct.length > 8) bits.push(ct);
+            if (ct.indexOf('http') === 0 || /^@/.test(ct)) continue;
+            if (bits.indexOf(ct) < 0) bits.push(ct);
             if (bits.length >= 4) break;
           }
           if (bits.length) title = bits[0];
           if (bits.length > 1) preview = bits[1];
         }
-        if (!title) {
-          // Fallback: longest non-handle line in article when labeled Article
-          var best = '';
-          var scan = article.querySelectorAll('span, div, a');
-          for (var k = 0; k < scan.length && k < 120; k++) {
-            var lt = visibleText(scan[k]);
-            if (!lt || lt.length < 12 || lt.length > 200) continue;
-            if (/^@/.test(lt) || /^(Artykuł|Article)$/i.test(lt)) continue;
-            if (lt.length > best.length) best = lt;
+        // Guard: title must not equal author/handle chrome
+        if (title) {
+          for (var u2 = 0; u2 < userNameEls.length; u2++) {
+            var un = visibleText(userNameEls[u2]);
+            if (un && (title === un || un.indexOf(title) === 0 || title.indexOf(un.split('\n')[0]) === 0)) {
+              title = preview; preview = null; break;
+            }
           }
-          if (best) title = best;
         }
         var out = {};
         if (title) out.title = title;
         if (preview) out.preview = preview;
-        return Object.keys(out).length ? out : { title: label };
+        return Object.keys(out).length ? out : null;
       }
       /**
        * Retweet socialContext: locale-independent via retweet SVG path near
@@ -518,9 +588,11 @@ enum AgentDOM {
           seen[type] = true;
           media.push({ type: type });
         }
-        if (hasArticle) add('article');
+        if (hasArticle || article.querySelector('[data-testid="article-cover-image"]')) {
+          add('article');
+        }
         var nodes = article.querySelectorAll(
-          '[data-testid="tweetPhoto"],[data-testid="videoComponent"],[data-testid="videoPlayer"],[data-testid="card.wrapper"]'
+          '[data-testid="tweetPhoto"],[data-testid="videoComponent"],[data-testid="videoPlayer"],[data-testid="card.wrapper"],[data-testid="article-cover-image"]'
         );
         for (var i = 0; i < nodes.length; i++) {
           var node = nodes[i];
@@ -528,6 +600,7 @@ enum AgentDOM {
           var tid = node.getAttribute('data-testid') || '';
           if (tid === 'tweetPhoto') add('photo');
           else if (tid === 'videoComponent' || tid === 'videoPlayer') add('video');
+          else if (tid === 'article-cover-image') add('article');
           else if (tid === 'card.wrapper' && !hasArticle) add('card');
         }
         return media;
@@ -732,20 +805,101 @@ enum AgentDOM {
         }
         return actorsLen;
       }
+      function statusCandidatesFromReact(el) {
+        var out = [];
+        var seenIds = {};
+        if (!el) return out;
+        var seen = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+        function add(href) {
+          var st = statusFromHref(href);
+          if (!st || seenIds[st.id]) return;
+          seenIds[st.id] = true;
+          out.push(st);
+        }
+        function walk(node, depth) {
+          if (!node || depth > 16 || out.length > 8) return;
+          if (typeof node === 'string') { add(node); return; }
+          if (typeof node !== 'object') return;
+          if (node.nodeType) return;
+          if (seen) {
+            try { if (seen.has(node)) return; seen.add(node); } catch (e) { return; }
+          }
+          try {
+            if (typeof node.href === 'string') add(node.href);
+            if (typeof node.url === 'string') add(node.url);
+            if (node.id != null && node.user && (node.user.screen_name || node.user.screenName)) {
+              add('https://x.com/' + (node.user.screen_name || node.user.screenName) +
+                '/status/' + String(node.id));
+            }
+            if (node.rest_id != null && (node.screen_name || node.user_screen_name)) {
+              add('https://x.com/' + (node.screen_name || node.user_screen_name) +
+                '/status/' + String(node.rest_id));
+            }
+          } catch (e) {}
+          try {
+            for (var k in node) {
+              if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
+              if (k === 'stateNode' || k === '_owner' || k === 'containerInfo') continue;
+              try { walk(node[k], depth + 1); } catch (e) {}
+            }
+          } catch (e) {}
+        }
+        var propKeys = Object.keys(el);
+        for (var i = 0; i < propKeys.length; i++) {
+          var key = propKeys[i];
+          if (key.indexOf('__reactFiber') !== 0 &&
+              key.indexOf('__reactProps') !== 0 &&
+              key.indexOf('__reactInternalInstance') !== 0) continue;
+          try { walk(el[key], 0); } catch (e) {}
+        }
+        return out;
+      }
       function targetFrom(cell) {
         var article = cell.querySelector('article[data-testid="tweet"]');
         var scope = article || cell;
-        var links = scope.querySelectorAll('a[href*="/status/"]');
         var st = null;
+        // 1) Clean status <a> links (skip analytics/photo/…)
+        var links = scope.querySelectorAll('a[href*="/status/"], [href*="/status/"]');
         for (var i = 0; i < links.length; i++) {
           var href = links[i].getAttribute('href') || '';
           if (/\/(analytics|photo|video|likes)(\/|$)/.test(href)) continue;
           st = statusFromHref(href);
           if (st) break;
         }
+        // 2) time → closest anchor (common on like/repost notification embeds)
+        if (!st) {
+          var timeEl = scope.querySelector('time');
+          if (timeEl) {
+            var a = timeEl.closest && timeEl.closest('a[href]');
+            if (a) st = statusFromHref(a.getAttribute('href') || '');
+            var p = timeEl.parentElement;
+            while (!st && p && p !== scope) {
+              if (p.tagName === 'A') st = statusFromHref(p.getAttribute('href') || '');
+              p = p.parentElement;
+            }
+          }
+        }
+        // 3) role=link / any href attr on the cell
+        if (!st) {
+          var anyHref = cell.querySelectorAll('[href*="/status/"]');
+          for (var h = 0; h < anyHref.length; h++) {
+            var hh = anyHref[h].getAttribute('href') || '';
+            if (/\/(analytics|photo|video|likes)(\/|$)/.test(hh)) continue;
+            st = statusFromHref(hh);
+            if (st) break;
+          }
+        }
         var text = '';
         var textEl = scope.querySelector('[data-testid="tweetText"]');
         if (textEl) text = visibleText(textEl);
+        // 4) React fiber/props — like/repost embeds often omit status <a>.
+        // Only use when a tweet preview is present (avoid follow cells inheriting
+        // a neighboring status id from shared fiber state).
+        if (!st && text) {
+          var cands = statusCandidatesFromReact(scope);
+          if (!cands.length) cands = statusCandidatesFromReact(cell);
+          if (cands.length) st = cands[0];
+        }
         if (!st && !text) return null;
         var out = {};
         if (st) { out.id = st.id; out.url = st.url; }

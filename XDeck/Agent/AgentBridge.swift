@@ -638,8 +638,14 @@ final class AgentBridge {
         let column = try columnFromBody(obj, defaultColumn: defaultColumn)
         let result = try await ColumnRegistry.shared.navigate(column: column, to: url)
         // HTTP 200 with ok:false when SPA did not become ready — agents should read fields.
+        let repliesLoadedJSON: String = {
+            if let flag = result.repliesLoaded {
+                return #","repliesLoaded":\#(flag ? "true" : "false")"#
+            }
+            return ""
+        }()
         return (200, """
-        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs)}
+        {"ok":\(result.ok ? "true" : "false"),"column":\(result.column),"url":\(Self.jsonString(result.url)),"finalUrl":\(Self.jsonString(result.finalURL)),"method":\(Self.jsonString(result.method)),"ready":\(result.ready ? "true" : "false"),"tweetCount":\(result.tweetCount),"errorShell":\(result.errorShell ? "true" : "false"),"challenge":\(result.challenge ? "true" : "false"),"retries":\(result.retries),"waitedMs":\(result.waitedMs)\(repliesLoadedJSON)}
         """)
     }
 
