@@ -53,7 +53,10 @@ node cli.js navigate 0 'https://x.com/search?q=test&src=typed_query'
 node cli.js scroll 0 800
 node cli.js reload 0
 npm run smoke
+npm run evals
 ```
+
+Live scenario suite (feed / topic / poll / write-honesty): see [`evals/README.md`](./evals/README.md).
 
 ## Client snippets
 
