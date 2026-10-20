@@ -331,7 +331,7 @@ struct ContentView: View {
                                             Text("Agent :\(AgentBridge.shared.port)")
                                                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                                 .foregroundColor(Color(hex: "#1D9BF0"))
-                                                .help("Localhost agent bridge is listening (XDECK_AGENT=1). Token in Application Support/XDeck/agent.token")
+                                                .help("Localhost agent bridge is listening (XDECK_AGENT=1). Token: /Users/Shared/XDeck-agent/agent.token (or App Support/XDeck)")
                                         }
                                         HStack(spacing: 8) {
                                             Button {

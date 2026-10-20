@@ -119,4 +119,72 @@ enum AgentDOM {
         })()
         """
     }
+
+    /// Detect login / CAPTCHA / challenge / SPA error shells so agents can set needs_human
+    /// instead of treating chrome mush as a timeline.
+    static let challengeProbeJS = #"""
+    (function() {
+      var href = String(location.href || '');
+      var path = String(location.pathname || '');
+      var body = document.body;
+      var text = '';
+      if (body) {
+        text = document.visibilityState === 'hidden'
+          ? (body.textContent || '')
+          : (body.innerText || body.textContent || '');
+      }
+      if (text.length > 8000) text = text.slice(0, 8000);
+      var lower = text.toLowerCase();
+      var reasons = [];
+      var hasTweets = !!document.querySelector('article[data-testid="tweet"]');
+      var hasPrimary = !!document.querySelector('[data-testid="primaryColumn"]');
+
+      if (/\/i\/flow\/login|\/login\/?$|\/i\/flow\/signup|\/account\/access/i.test(href) ||
+          /\/i\/flow\/login|\/login\/?$|\/account\/access/i.test(path)) {
+        reasons.push('login_url');
+      }
+      if (/captcha|arkose|funcaptcha|\/challenge/i.test(href) ||
+          /verify you(?:'| a)?re (?:a )?human|are you a robot|unusual activity|confirm you(?:'| a)?re not a bot|complete the challenge/i.test(lower)) {
+        reasons.push('challenge_or_captcha');
+      }
+      if (document.querySelector(
+        'input[autocomplete="username"], input[name="password"], [data-testid="LoginForm"], [data-testid="loginButton"], form[action*="login"]'
+      )) {
+        reasons.push('login_form');
+      }
+      if (/log in to (?:x|twitter)|sign in to (?:x|twitter)|to get started,? log in/i.test(lower) && !hasTweets) {
+        reasons.push('login_prompt');
+      }
+      // x.com SPA error shell (often after brittle navigate). Require a *visible*
+      // error node or strong body copy — do not treat empty mid-load timelines
+      // or CSS-only `.errorContainer` rules as failure.
+      var errEl = document.querySelector('.errorContainer');
+      var errCopy = errEl
+        ? ((errEl.innerText || errEl.textContent || '').trim())
+        : '';
+      var errVisible = errCopy.length > 0 &&
+        /something went wrong|try again|javascript is disabled|js disabled/i.test(errCopy);
+      var bodyError = /something went wrong\.?\s*try again|this page (?:isn.?t|is not) available|page doesn.?t exist|rate limit(?:ed)?|temporarily restricted|javascript is disabled/i.test(lower);
+      if (!hasTweets && !hasPrimary && (errVisible || bodyError)) {
+        reasons.push('error_shell');
+      }
+
+      // Dedupe while preserving order
+      var seen = {};
+      var unique = [];
+      for (var i = 0; i < reasons.length; i++) {
+        if (!seen[reasons[i]]) {
+          seen[reasons[i]] = true;
+          unique.push(reasons[i]);
+        }
+      }
+      return {
+        needs_human: unique.length > 0,
+        reasons: unique,
+        href: href,
+        hasTweets: hasTweets,
+        hasPrimaryColumn: hasPrimary
+      };
+    })()
+    """#
 }
