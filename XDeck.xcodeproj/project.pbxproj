@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		A9F6000120A9F6A100000001 /* ColumnRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000020A9F6A100000001 /* ColumnRegistry.swift */; };
 		A9F6000320A9F6A100000002 /* AgentBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000220A9F6A100000002 /* AgentBridge.swift */; };
+		A9F6000620A9F6A100000005 /* AgentDOM.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9F6000520A9F6A100000005 /* AgentDOM.swift */; };
 		5B0DC3542A8FC79400268684 /* WebViewConfigurations.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B0DC3532A8FC79400268684 /* WebViewConfigurations.swift */; };
 		5B1CC26B2A95026F00DF7D83 /* GitHubIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B1CC26A2A95026F00DF7D83 /* GitHubIcon.swift */; };
 		5B1CC26F2A95944A00DF7D83 /* AppearanceToggle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B1CC26E2A95944A00DF7D83 /* AppearanceToggle.swift */; };
@@ -35,6 +36,7 @@
 		A9F6000020A9F6A100000001 /* ColumnRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColumnRegistry.swift; sourceTree = "<group>"; };
 		A9F6000220A9F6A100000002 /* AgentBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentBridge.swift; sourceTree = "<group>"; };
 		A9F6000420A9F6A100000003 /* XDeck.Debug.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = XDeck.Debug.entitlements; sourceTree = "<group>"; };
+		A9F6000520A9F6A100000005 /* AgentDOM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDOM.swift; sourceTree = "<group>"; };
 		5B0DC3532A8FC79400268684 /* WebViewConfigurations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewConfigurations.swift; sourceTree = "<group>"; };
 		5B1CC26A2A95026F00DF7D83 /* GitHubIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubIcon.swift; sourceTree = "<group>"; };
 		5B1CC26E2A95944A00DF7D83 /* AppearanceToggle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceToggle.swift; sourceTree = "<group>"; };
@@ -75,6 +77,7 @@
 			children = (
 				A9F6000020A9F6A100000001 /* ColumnRegistry.swift */,
 				A9F6000220A9F6A100000002 /* AgentBridge.swift */,
+				A9F6000520A9F6A100000005 /* AgentDOM.swift */,
 			);
 			path = Agent;
 			sourceTree = "<group>";
@@ -247,6 +250,7 @@
 				5B90B8C32A8E6D7300185EAA /* XDeckApp.swift in Sources */,
 				A9F6000120A9F6A100000001 /* ColumnRegistry.swift in Sources */,
 				A9F6000320A9F6A100000002 /* AgentBridge.swift in Sources */,
+				A9F6000620A9F6A100000005 /* AgentDOM.swift in Sources */,
 				5B1CC2732A95969600DF7D83 /* MoonIcon.swift in Sources */,
 				5B4A3FE22C17646F00043FC1 /* GitHubSponsorIcon.swift in Sources */,
 				5BC7F4812C17EA42002A37C2 /* UpdateButton.swift in Sources */,

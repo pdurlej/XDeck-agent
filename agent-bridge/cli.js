@@ -4,17 +4,23 @@ import {
   readColumn,
   evalJs,
   health,
+  navigateColumn,
+  scrollColumn,
+  reloadColumn,
   tokenPath,
   DEFAULT_BASE,
 } from "./lib/client.js";
 
 function usage() {
-  console.error(`xdeck-agent — thin CLI for XDeck localhost bridge (read-only)
+  console.error(`xdeck-agent — CLI for XDeck localhost bridge (lab telescope)
 
 Usage:
   xdeck-agent health
   xdeck-agent columns
-  xdeck-agent read <columnIndex> [--max-chars N]
+  xdeck-agent read <columnIndex> [--no-text] [--max-chars N]
+  xdeck-agent navigate <columnIndex> <url>
+  xdeck-agent scroll <columnIndex> [deltaY]
+  xdeck-agent reload <columnIndex>
   xdeck-agent eval <columnIndex> <js>
 
 Env:
@@ -46,7 +52,34 @@ async function main() {
         let maxChars;
         const maxIdx = rest.indexOf("--max-chars");
         if (maxIdx >= 0) maxChars = Number(rest[maxIdx + 1]);
-        console.log(JSON.stringify(await readColumn(index, { maxChars }), null, 2));
+        const includeText = !rest.includes("--no-text");
+        console.log(
+          JSON.stringify(
+            await readColumn(index, { maxChars, includeText }),
+            null,
+            2
+          )
+        );
+        break;
+      }
+      case "navigate": {
+        const index = Number(rest[0]);
+        const url = rest[1];
+        if (!Number.isInteger(index) || !url) usage();
+        console.log(JSON.stringify(await navigateColumn(index, url), null, 2));
+        break;
+      }
+      case "scroll": {
+        const index = Number(rest[0]);
+        const delta = rest[1] !== undefined ? Number(rest[1]) : 800;
+        if (!Number.isInteger(index)) usage();
+        console.log(JSON.stringify(await scrollColumn(index, delta), null, 2));
+        break;
+      }
+      case "reload": {
+        const index = Number(rest[0]);
+        if (!Number.isInteger(index)) usage();
+        console.log(JSON.stringify(await reloadColumn(index), null, 2));
         break;
       }
       case "eval": {

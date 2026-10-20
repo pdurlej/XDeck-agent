@@ -125,21 +125,28 @@ final class AgentBridge {
             [.posixPermissions: 0o600],
             ofItemAtPath: url.path
         )
-        // Mirror outside the container so CLI/agents can read it (Debug entitlement).
+        // Mirror outside the container so CLI/MCP can read the bearer (Debug entitlements).
+        // Prefer portable /Users/Shared (absolute-path exception) plus best-effort home App Support.
+        // Do not use /tmp.
         let mirrors: [URL] = [
+            URL(fileURLWithPath: "/Users/Shared/XDeck-agent/agent.token"),
             (try? externalSupportDirectory().appendingPathComponent("agent.token")).flatMap { $0 },
-            URL(fileURLWithPath: "/tmp/xdeck-agent/agent.token"),
         ].compactMap { $0 }
         for mirror in mirrors {
-            try? FileManager.default.createDirectory(
-                at: mirror.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try? token.write(to: mirror, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: mirror.path
-            )
+            do {
+                try FileManager.default.createDirectory(
+                    at: mirror.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try token.write(to: mirror, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: mirror.path
+                )
+                Self.writeStatus("token mirrored to \(mirror.path)")
+            } catch {
+                Self.writeStatus("token mirror failed \(mirror.path): \(error.localizedDescription)")
+            }
         }
         return url
     }
@@ -322,31 +329,104 @@ final class AgentBridge {
             return (200, columnsJSON())
         case ("GET", _) where path.hasPrefix("/columns/") && path.hasSuffix("/text"):
             let index = try parseColumnIndex(path: path, suffix: "/text")
-            let maxChars = 200_000
-            let js = """
-            (function() {
-              var t = (document.body && document.body.innerText) ? document.body.innerText : '';
-              if (t.length > \(maxChars)) t = t.slice(0, \(maxChars));
-              return t;
-            })()
-            """
-            let textJSON = try await ColumnRegistry.shared.evaluateJavaScript(column: index, script: js)
-            // textJSON is already a JSON string literal from stringifyJSResult
-            return (200, #"{"column":\#(index),"text":\#(textJSON)}"#)
+            return (200, try await readColumnJSON(index: index, includeText: true))
+        case ("GET", _) where path.hasPrefix("/columns/") && path.hasSuffix("/tweets"):
+            let index = try parseColumnIndex(path: path, suffix: "/tweets")
+            return (200, try await readColumnJSON(index: index, includeText: false))
         case ("POST", "/eval"):
             return try await handleEval(body: body, defaultColumn: nil)
         case ("POST", _) where path.hasPrefix("/columns/") && path.hasSuffix("/eval"):
             let index = try parseColumnIndex(path: path, suffix: "/eval")
             return try await handleEval(body: body, defaultColumn: index)
-        case ("POST", "/click"), ("POST", "/type"), ("POST", "/post_tweet"), ("POST", "/navigate"):
-            // Write surface stub — not enabled in the read-only weekend slice.
-            throw AgentBridgeError.writeRequiresConfirm
+        case ("POST", "/navigate"):
+            return try await handleNavigate(body: body, defaultColumn: nil)
+        case ("POST", _) where path.hasPrefix("/columns/") && path.hasSuffix("/navigate"):
+            let index = try parseColumnIndex(path: path, suffix: "/navigate")
+            return try await handleNavigate(body: body, defaultColumn: index)
+        case ("POST", "/scroll"):
+            return try await handleScroll(body: body, defaultColumn: nil)
+        case ("POST", _) where path.hasPrefix("/columns/") && path.hasSuffix("/scroll"):
+            let index = try parseColumnIndex(path: path, suffix: "/scroll")
+            return try await handleScroll(body: body, defaultColumn: index)
+        case ("POST", "/reload"):
+            return try handleReload(body: body, defaultColumn: nil)
+        case ("POST", _) where path.hasPrefix("/columns/") && path.hasSuffix("/reload"):
+            let index = try parseColumnIndex(path: path, suffix: "/reload")
+            return try handleReload(body: body, defaultColumn: index)
+        case ("POST", "/click"), ("POST", "/type"), ("POST", "/post_tweet"),
+             ("POST", "/reply"), ("POST", "/retweet"), ("POST", "/like"):
+            throw AgentBridgeError.notImplemented("DOM write / \(path)")
         default:
             if method != "GET" && method != "POST" {
                 throw AgentBridgeError.methodNotAllowed
             }
             throw AgentBridgeError.notFound
         }
+    }
+
+    private func readColumnJSON(index: Int, includeText: Bool) async throws -> String {
+        let tweetsJSON = try await ColumnRegistry.shared.evaluateJavaScript(
+            column: index,
+            script: AgentDOM.extractTweetsJS
+        )
+        var parts = [
+            #""column":\#(index)"#,
+            #""tweets":\#(tweetsJSON)"#,
+        ]
+        // tweetCount from parsed array length when possible
+        if let data = tweetsJSON.data(using: .utf8),
+           let arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+            parts.append(#""tweetCount":\#(arr.count)"#)
+        }
+        if includeText {
+            let textJSON = try await ColumnRegistry.shared.evaluateJavaScript(
+                column: index,
+                script: AgentDOM.innerTextJS(maxChars: 200_000)
+            )
+            parts.append(#""text":\#(textJSON)"#)
+        }
+        return "{\(parts.joined(separator: ","))}"
+    }
+
+    private func columnFromBody(_ obj: [String: Any], defaultColumn: Int?) throws -> Int {
+        if let defaultColumn { return defaultColumn }
+        if let n = obj["column"] as? Int { return n }
+        if let n = obj["column"] as? NSNumber { return n.intValue }
+        throw AgentBridgeError.badRequest("Missing column index")
+    }
+
+    private func handleNavigate(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
+        guard let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            throw AgentBridgeError.badRequest("JSON body required: { \"url\": \"https://x.com/...\", \"column\": 0 }")
+        }
+        guard let urlString = obj["url"] as? String,
+              let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            throw AgentBridgeError.badRequest("Missing or invalid url (http/https only)")
+        }
+        let column = try columnFromBody(obj, defaultColumn: defaultColumn)
+        try await ColumnRegistry.shared.navigate(column: column, to: url)
+        return (200, #"{"ok":true,"column":\#(column),"url":\#(Self.jsonString(url.absoluteString))}"#)
+    }
+
+    private func handleScroll(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
+        let obj = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+        let column = try columnFromBody(obj, defaultColumn: defaultColumn)
+        var delta = 800
+        if let n = obj["deltaY"] as? Int { delta = n }
+        else if let n = obj["deltaY"] as? NSNumber { delta = n.intValue }
+        else if let n = obj["pixels"] as? Int { delta = n }
+        else if let n = obj["pixels"] as? NSNumber { delta = n.intValue }
+        let result = try await ColumnRegistry.shared.scroll(column: column, deltaY: delta)
+        return (200, #"{"ok":true,"column":\#(column),"deltaY":\#(delta),"result":\#(result)}"#)
+    }
+
+    private func handleReload(body: Data, defaultColumn: Int?) throws -> (Int, String) {
+        let obj = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+        let column = try columnFromBody(obj, defaultColumn: defaultColumn)
+        try ColumnRegistry.shared.reload(column: column)
+        return (200, #"{"ok":true,"column":\#(column),"reloaded":true}"#)
     }
 
     private func handleEval(body: Data, defaultColumn: Int?) async throws -> (Int, String) {
@@ -414,6 +494,7 @@ final class AgentBridge {
         case 404: reason = "Not Found"
         case 405: reason = "Method Not Allowed"
         case 413: reason = "Payload Too Large"
+        case 501: reason = "Not Implemented"
         default: reason = "Error"
         }
         let bodyData = Data(body.utf8)

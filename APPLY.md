@@ -12,6 +12,7 @@ Overlay these paths onto a checkout of [morishin/XDeck](https://github.com/moris
 |-------------|
 | `XDeck/Agent/ColumnRegistry.swift` |
 | `XDeck/Agent/AgentBridge.swift` |
+| `XDeck/Agent/AgentDOM.swift` |
 | `XDeck/XDeck.Debug.entitlements` |
 | `agent-bridge/package.json` |
 | `agent-bridge/package-lock.json` |

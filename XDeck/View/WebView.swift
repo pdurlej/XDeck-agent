@@ -114,6 +114,11 @@ class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         owner.isLoading = false
+        // Keep SwiftUI binding / lastUrl in sync when agent navigates via WKWebView.load.
+        if let finished = webView.url {
+            owner.url = finished
+            lastUrl = finished
+        }
         if let columnIndex = owner.columnIndex {
             Task { @MainActor in
                 ColumnRegistry.shared.update(index: columnIndex, url: webView.url ?? owner.url, isLoading: false)

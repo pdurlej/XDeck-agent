@@ -80,6 +80,43 @@ final class ColumnRegistry {
         }
     }
 
+    /// Load a URL in the column WebView (e.g. `https://x.com/search?q=…`).
+    /// Prefer same-origin `location.assign` (keeps SPA session); fall back to `load`.
+    func navigate(column index: Int, to url: URL) async throws {
+        guard let webView = entries[index]?.webView else {
+            throw AgentBridgeError.columnNotFound(index)
+        }
+        entries[index]?.url = url
+        entries[index]?.isLoading = true
+        let currentHost = webView.url?.host?.lowercased()
+        let targetHost = url.host?.lowercased()
+        let sameSite = currentHost != nil && targetHost != nil &&
+            (currentHost == targetHost
+                || (currentHost!.hasSuffix("x.com") && targetHost!.hasSuffix("x.com"))
+                || (currentHost!.hasSuffix("twitter.com") && targetHost!.hasSuffix("twitter.com")))
+        if sameSite {
+            let escaped = url.absoluteString
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+            let js = "window.location.assign('\(escaped)'); true"
+            _ = try await evaluateJavaScript(column: index, script: js)
+        } else {
+            webView.load(URLRequest(url: url))
+        }
+    }
+
+    func reload(column index: Int) throws {
+        guard let webView = entries[index]?.webView else {
+            throw AgentBridgeError.columnNotFound(index)
+        }
+        entries[index]?.isLoading = true
+        webView.reload()
+    }
+
+    func scroll(column index: Int, deltaY: Int) async throws -> String {
+        try await evaluateJavaScript(column: index, script: AgentDOM.scrollJS(deltaY: deltaY))
+    }
+
     private static func escapeJSONString(_ value: String) -> String {
         let escaped = value
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -129,7 +166,7 @@ enum AgentBridgeError: LocalizedError {
     case badRequest(String)
     case methodNotAllowed
     case notFound
-    case writeRequiresConfirm
+    case notImplemented(String)
 
     var errorDescription: String? {
         switch self {
@@ -145,8 +182,8 @@ enum AgentBridgeError: LocalizedError {
             return "Method not allowed"
         case .notFound:
             return "Not found"
-        case .writeRequiresConfirm:
-            return "Write endpoints require confirm:true (not enabled in read-only slice)"
+        case .notImplemented(let feature):
+            return "\(feature) is not implemented. This bridge is a read/navigate lab telescope — no post/reply/like/click tools. Do not use eval_js to mutate the page unless a human explicitly asks."
         }
     }
 
@@ -154,7 +191,8 @@ enum AgentBridgeError: LocalizedError {
         switch self {
         case .unauthorized: return 401
         case .columnNotFound, .notFound: return 404
-        case .badRequest, .writeRequiresConfirm: return 400
+        case .badRequest: return 400
+        case .notImplemented: return 501
         case .methodNotAllowed: return 405
         case .jsError: return 500
         }

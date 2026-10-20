@@ -12,15 +12,16 @@
 	     Keep this Debug-only; do not ship to Release/Homebrew. -->
 	<key>com.apple.security.network.server</key>
 	<true/>
-	<!-- Mirror agent.token outside the container for local CLI/MCP smoke. -->
+	<!-- Mirror agent.token for CLI/MCP outside the sandbox container.
+	     Prefer portable /Users/Shared (no per-user absolute paths in the plist).
+	     Also keep home-relative App Support for environments where it works. -->
 	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
 	<array>
 		<string>Library/Application Support/XDeck/</string>
 	</array>
 	<key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
 	<array>
-		<string>/Users/pd/Library/Application Support/XDeck/</string>
-		<string>/tmp/xdeck-agent/</string>
+		<string>/Users/Shared/XDeck-agent/</string>
 	</array>
 </dict>
 </plist>

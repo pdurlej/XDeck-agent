@@ -74,7 +74,15 @@ async function main() {
     const listed = await request("tools/list", {});
     if (listed.error) throw new Error(JSON.stringify(listed.error));
     const names = (listed.result?.tools || []).map((t) => t.name).sort();
-    const expected = ["eval_js", "health", "list_columns", "read_column"];
+    const expected = [
+      "eval_js",
+      "health",
+      "list_columns",
+      "navigate_column",
+      "read_column",
+      "reload_column",
+      "scroll_column",
+    ];
     for (const name of expected) {
       if (!names.includes(name)) {
         throw new Error(`missing tool ${name}; got ${names.join(", ")}`);
@@ -95,14 +103,14 @@ async function main() {
     const parsed = JSON.parse(text);
     if (!parsed.ok) throw new Error(`health not ok: ${text}`);
 
-    // Extra read-only call
-    const cols = await request("tools/call", {
-      name: "list_columns",
-      arguments: {},
+    const readCall = await request("tools/call", {
+      name: "read_column",
+      arguments: { column: 0, include_text: false },
     });
-    if (cols.result?.isError) {
-      throw new Error(cols.result.content?.[0]?.text || "list_columns error");
+    if (readCall.result?.isError) {
+      throw new Error(readCall.result.content?.[0]?.text || "read_column error");
     }
+    const readParsed = JSON.parse(readCall.result?.content?.[0]?.text || "{}");
 
     console.log(
       JSON.stringify(
@@ -113,6 +121,10 @@ async function main() {
             user: parsed.user,
             columnCount: parsed.columnCount,
             port: parsed.port,
+          },
+          read_column: {
+            tweetCount: readParsed.tweetCount ?? readParsed.tweets?.length,
+            sampleId: readParsed.tweets?.[0]?.id ?? null,
           },
         },
         null,
