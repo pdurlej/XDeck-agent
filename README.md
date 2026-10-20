@@ -1,16 +1,20 @@
 # XDeck-agent
 
-> **Lab telescope, not a product.**  
-> Reads / navigates **whatever is already visible** in an open Debug XDeck window.  
-> **No** topic-search product · **no** unattended overnight agent · **no** post/reply/like tools.  
-> Honest limits: see [docs in the Project store](https://github.com/pdurlej/XDeck-agent) / red-team notes (`xdeck-agent-redteam.md` in the companion Project). Prefer **official X API / X MCP** for search & writes.
+**XDeck-agent:** a local, read-only sidekick for your X deck. It glances and scrolls now and then, so you catch the posts worth your time without living in the feed. Your tweet FOMO, handled.
 
-Personal macOS fork of **[morishin/XDeck](https://github.com/morishin/XDeck)** with an **opt-in localhost agent bridge** so Cursor / Claude Code / Codex can inspect the same live WKWebView x.com session (no cookie export).
+Fork of **[morishin/XDeck](https://github.com/morishin/XDeck)** under MIT. Unaffiliated with X / Twitter.
 
-Upstream XDeck is an 𝕏 / TweetDeck-style multi-column macOS client. This repo keeps that app and adds Debug-only agent tooling.
+### Principles
 
-> **Upstream:** https://github.com/morishin/XDeck — credit for the base app.  
-> **This fork:** unofficial, personal, Debug-only. Not for App Store / Homebrew Release.
+- **Mac-only** — loopback `127.0.0.1`, no cloud service
+- **Read-only** — no posting, liking, replying, or clicking through the bridge
+- **Drafts are suggestions** — you post yourself in the open X UI
+- **Human pacing** — glance and scroll now and then, not a firehose
+- **`eval_js` off by default** — opt-in only when you explicitly enable it
+
+Upstream XDeck is an 𝕏 / TweetDeck-style multi-column macOS client. This repo keeps that app and adds Debug-only agent tooling (localhost bridge + MCP) so Cursor / Claude Code / Codex can inspect the same live WKWebView x.com session — no cookie export.
+
+> Prefer the **official X API / X MCP** if you need search products or writes. Honest red-team notes live in the companion Project (`xdeck-agent-redteam.md`).
 
 <img width="120" height="120" alt="XDeck icon" src="https://github.com/user-attachments/assets/b0076952-c7b4-4024-a337-8df37c05f88c" />
 
@@ -81,17 +85,13 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 ## MCP (Cursor · Claude Code · Codex)
 
-**Canonical checkout (this Mac):** keep Claude Code / Cursor / Codex pointed at one clone on **`main`** (or the PR branch under test):
+Point Claude Code / Cursor / Codex at **your clone** on `main` (or the PR branch under test). Replace `path-to-your-clone` below with that checkout path.
 
-```text
-/Users/pd/Developer/BuildScratch/XDeck-agent-bridge
-```
-
-Entrypoint: `…/XDeck-agent-bridge/agent-bridge/mcp-server.js`  
-Fast-forward when stale (must not stay on old P0 tips that still expose `eval_js` by default):
+Entrypoint: `path-to-your-clone/agent-bridge/mcp-server.js`  
+Fast-forward when stale (must not stay on old tips that still expose `eval_js` by default):
 
 ```sh
-cd /Users/pd/Developer/BuildScratch/XDeck-agent-bridge
+cd path-to-your-clone
 git fetch origin && git checkout main && git pull --ff-only origin main
 cd agent-bridge && npm install && npm run smoke
 ```
@@ -110,7 +110,7 @@ npm run smoke
     "xdeck-agent": {
       "command": "/opt/homebrew/bin/node",
       "args": [
-        "/Users/pd/Developer/BuildScratch/XDeck-agent-bridge/agent-bridge/mcp-server.js"
+        "path-to-your-clone/agent-bridge/mcp-server.js"
       ]
     }
   }
@@ -122,7 +122,7 @@ npm run smoke
 ```sh
 claude mcp add -s user xdeck-agent -- \
   /opt/homebrew/bin/node \
-  /Users/pd/Developer/BuildScratch/XDeck-agent-bridge/agent-bridge/mcp-server.js
+  path-to-your-clone/agent-bridge/mcp-server.js
 ```
 
 ### Codex
@@ -130,7 +130,7 @@ claude mcp add -s user xdeck-agent -- \
 ```sh
 codex mcp add xdeck-agent -- \
   /opt/homebrew/bin/node \
-  /Users/pd/Developer/BuildScratch/XDeck-agent-bridge/agent-bridge/mcp-server.js
+  path-to-your-clone/agent-bridge/mcp-server.js
 ```
 
 Optional env: `XDECK_AGENT_URL`, `XDECK_AGENT_TOKEN`, `XDECK_AGENT_TOKEN_FILE`.

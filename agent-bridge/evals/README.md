@@ -39,4 +39,4 @@ Exit code `1` if any scenario is `fail`; `partial` still exits `0`.
 Same as CLI/MCP: `XDECK_AGENT_URL`, `XDECK_AGENT_TOKEN`, `XDECK_AGENT_TOKEN_FILE`.  
 Scenario 5 + 13 expect `XDECK_AGENT_EVAL` **unset** on the running XDeck app (and harness clears it for the MCP spawn).
 
-**Do not** kill Piotr’s shared `:18765` bridge during reviews. For TIME_WAIT restart tests, use a private DerivedData build and set `XDECK_EVAL_ALLOW_BRIDGE_KILL=1`. Without that flag, scenario 12 is skipped (`partial`).
+**Do not** kill a shared live `:18765` bridge during reviews. For TIME_WAIT restart tests, use a private DerivedData build and set `XDECK_EVAL_ALLOW_BRIDGE_KILL=1`. Without that flag, scenario 12 is skipped (`partial`).

@@ -900,7 +900,7 @@ enum AgentDOM {
       /**
        * N2: React status recovery must stay inside this cell.
        * Never walk fiber.return / sibling / alternate — that inherits a
-       * neighbour notification's status id (e.g. every like → basal).
+       * neighbour notification's status id (e.g. every like → a neighbour post id).
        */
       function statusCandidatesFromReact(el) {
         var out = [];
@@ -1020,7 +1020,7 @@ enum AgentDOM {
         var textEl = scope.querySelector('[data-testid="tweetText"]');
         if (textEl && cell.contains(textEl)) text = visibleText(textEl);
         // 4) React props on *this cell's* nodes only. If nothing in-cell → null id
-        // (prefer missing over a neighbour's basal status id).
+        // (prefer missing over a neighbour post id).
         if (!st && text) {
           var cands = statusCandidatesFromReact(scope);
           if (!cands.length && scope !== cell) cands = statusCandidatesFromReact(cell);
