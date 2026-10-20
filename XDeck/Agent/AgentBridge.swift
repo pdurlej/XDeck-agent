@@ -1,13 +1,15 @@
+import Combine
 import Darwin
 import Foundation
 import Network
 import Security
 
 /// Opt-in localhost HTTP bridge for agents. Starts only when `XDECK_AGENT=1`.
-/// Binds `127.0.0.1:18765`, requires bearer token from `/Users/Shared/XDeck-agent`
-/// or Application Support (stable across restarts; never `/tmp`).
+/// Binds **only** `127.0.0.1:18765` (no IPv6 wildcard, no SO_REUSEADDR).
+/// Requires bearer token from `/Users/Shared/XDeck-agent` or Application Support
+/// (stable across restarts; never `/tmp`).
 @MainActor
-final class AgentBridge {
+final class AgentBridge: ObservableObject {
     static let shared = AgentBridge()
 
     static let defaultPort: UInt16 = 18765
@@ -16,13 +18,21 @@ final class AgentBridge {
     /// When unset, those routes return **HTTP 404** (same as an unregistered path).
     static let evalEnvFlag = "XDECK_AGENT_EVAL"
 
-    private(set) var isRunning = false
+    @Published private(set) var isRunning = false
+    /// Non-nil when bind failed (e.g. EADDRINUSE — another bridge already owns the port).
+    @Published private(set) var bindError: String?
+    /// Real local endpoint after `.ready`, e.g. `127.0.0.1:18765` (from listener.port).
+    @Published private(set) var boundEndpoint: String?
     private(set) var port: UInt16 = AgentBridge.defaultPort
     private(set) var tokenPath: URL?
 
     private var listener: NWListener?
     private var token: String = ""
     private var connections: [ObjectIdentifier: NWConnection] = [:]
+    /// True while a bind attempt is in flight (prevents double start before `.ready`).
+    private var isBinding = false
+    /// Host we asked Network.framework to bind (always IPv4 loopback).
+    private let bindHost = "127.0.0.1"
 
     private init() {}
 
@@ -45,18 +55,28 @@ final class AgentBridge {
     func startIfEnabled() {
         guard Self.isEnabledByEnvironment else {
             print("[AgentBridge] disabled (set \(Self.envFlag)=1 to enable)")
+            Self.writeStatus("disabled (set \(Self.envFlag)=1)")
             return
         }
-        guard !isRunning else { return }
+        guard !isRunning, !isBinding else { return }
         do {
             try start()
         } catch {
-            print("[AgentBridge] failed to start: \(error.localizedDescription)")
+            let message = error.localizedDescription
+            bindError = message
+            isRunning = false
+            isBinding = false
+            boundEndpoint = nil
+            print("[AgentBridge] failed to start: \(message)")
+            Self.writeStatus("start failed: \(message)")
         }
     }
 
     func start(port: UInt16 = AgentBridge.defaultPort) throws {
         self.port = port
+        bindError = nil
+        boundEndpoint = nil
+        isBinding = true
         let loaded = try Self.loadOrCreateToken()
         token = loaded.token
         tokenPath = loaded.path
@@ -68,40 +88,50 @@ final class AgentBridge {
             Self.writeStatus("token minted path=\(tokenPath?.path ?? "?")")
         }
 
-        // Bind explicitly to 127.0.0.1. Do NOT pass `on:` when using
-        // requiredLocalEndpoint (that combo historically never reached .ready
-        // under App Sandbox). Constructor throw *and* NWListener `.failed`
-        // both fall back to interfaceType=.loopback — a silent `.failed` left
-        // the bridge dead on some Macs.
-        try attachListener(preferExplicitLoopback: true)
+        // Bind ONLY to 127.0.0.1 via requiredLocalEndpoint.
+        // Do NOT fall back to requiredInterfaceType=.loopback (that reintroduces
+        // IPv6 wildcard *:18765). Never set allowLocalEndpointReuse on NWListener.
+        // Exclusive Darwin preflight (SO_REUSEADDR off) fails loud on EADDRINUSE.
+        try attachListener()
         print("[AgentBridge] token file \(tokenPath?.path ?? "(unknown)") (reused=\(loaded.reused))")
         Self.writeStatus("started token=\(tokenPath?.path ?? "?") reused=\(loaded.reused)")
     }
 
-    /// Prefer explicit `127.0.0.1` bind; on constructor error or `.failed`, retry
-    /// with `requiredInterfaceType = .loopback`. Never leave a `.failed` silent.
-    private func attachListener(preferExplicitLoopback: Bool) throws {
+    /// Bind IPv4 loopback only. On constructor throw or `.failed`, surface error
+    /// and stop — never fall back to a wildcard listener.
+    private func attachListener() throws {
         let port = self.port
-        let listener: NWListener
-        let bindMode: String
-        let usedExplicit: Bool
+        let host = bindHost
+        let bindMode = "requiredLocalEndpoint:\(host)"
 
-        if preferExplicitLoopback {
-            do {
-                listener = try Self.makeLoopbackListener(port: port)
-                bindMode = "requiredLocalEndpoint:127.0.0.1"
-                usedExplicit = true
-            } catch {
-                print("[AgentBridge] explicit 127.0.0.1 bind threw (\(error)); falling back to requiredInterfaceType=.loopback")
-                Self.writeStatus("explicit loopback bind threw: \(error); fallback interfaceType")
-                listener = try Self.makeInterfaceLoopbackListener(port: port)
-                bindMode = "requiredInterfaceType=.loopback"
-                usedExplicit = false
-            }
-        } else {
-            listener = try Self.makeInterfaceLoopbackListener(port: port)
-            bindMode = "requiredInterfaceType=.loopback"
-            usedExplicit = false
+        // Exclusive preflight: prove the port is free without SO_REUSEADDR.
+        // Closes before NWListener starts. Prefer fail over wildcard fallback.
+        do {
+            try Self.assertExclusiveLoopbackPort(host: host, port: port)
+        } catch {
+            let message = Self.describeBindFailure(error, host: host, port: port)
+            bindError = message
+            isRunning = false
+            isBinding = false
+            boundEndpoint = nil
+            print("[AgentBridge] \(message)")
+            Self.writeStatus(message)
+            throw AgentBridgeError.bindFailed(message)
+        }
+
+        let listener: NWListener
+        let parameters: NWParameters
+        do {
+            (listener, parameters) = try Self.makeLoopbackListener(host: host, port: port)
+        } catch {
+            let message = Self.describeBindFailure(error, host: host, port: port)
+            bindError = message
+            isRunning = false
+            isBinding = false
+            boundEndpoint = nil
+            print("[AgentBridge] \(message)")
+            Self.writeStatus(message)
+            throw AgentBridgeError.bindFailed(message)
         }
 
         self.listener?.cancel()
@@ -113,36 +143,47 @@ final class AgentBridge {
         listener.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                print("[AgentBridge] listening on 127.0.0.1:\(port) (\(bindMode))")
-                Self.writeStatus("listening on 127.0.0.1:\(port) mode=\(bindMode)")
-                Task { @MainActor in
-                    self?.isRunning = true
-                }
-            case .failed(let error):
-                print("[AgentBridge] listener .failed (\(bindMode)): \(error)")
-                Self.writeStatus("listener .failed mode=\(bindMode): \(error)")
                 Task { @MainActor in
                     guard let self else { return }
+                    let endpoint = Self.endpointLabel(from: listener, parameters: parameters, fallbackPort: port)
+                    self.boundEndpoint = endpoint
+                    self.bindError = nil
+                    self.isRunning = true
+                    self.isBinding = false
+                    print("[AgentBridge] listening on \(endpoint) (\(bindMode))")
+                    Self.writeStatus("listening on \(endpoint) mode=\(bindMode)")
+                }
+            case .failed(let error):
+                Task { @MainActor in
+                    guard let self else { return }
+                    let message = Self.describeBindFailure(error, host: host, port: port)
+                    print("[AgentBridge] listener .failed (\(bindMode)): \(message)")
+                    Self.writeStatus("listener .failed mode=\(bindMode): \(message)")
                     self.listener?.cancel()
                     self.listener = nil
                     self.isRunning = false
-                    if usedExplicit {
-                        print("[AgentBridge] primary bind .failed; retrying requiredInterfaceType=.loopback")
-                        Self.writeStatus("primary .failed → fallback interfaceType=.loopback")
-                        do {
-                            try self.attachListener(preferExplicitLoopback: false)
-                        } catch {
-                            print("[AgentBridge] fallback bind also failed: \(error.localizedDescription)")
-                            Self.writeStatus("fallback bind failed: \(error)")
-                        }
-                    } else {
-                        print("[AgentBridge] fallback listener .failed; bridge not listening")
-                        Self.writeStatus("fallback .failed; bridge down: \(error)")
-                    }
+                    self.isBinding = false
+                    self.boundEndpoint = nil
+                    self.bindError = message
+                    // Intentionally NO fallback to interfaceType=.loopback /
+                    // wildcard *:port — prefer a dead bridge over an open bind.
                 }
             case .waiting(let error):
-                print("[AgentBridge] listener waiting (\(bindMode)): \(error)")
-                Self.writeStatus("listener waiting mode=\(bindMode): \(error)")
+                // Address-in-use often surfaces as .waiting first.
+                let message = Self.describeBindFailure(error, host: host, port: port)
+                print("[AgentBridge] listener waiting (\(bindMode)): \(message)")
+                Self.writeStatus("listener waiting mode=\(bindMode): \(message)")
+                if Self.isAddressInUse(error) {
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.listener?.cancel()
+                        self.listener = nil
+                        self.isRunning = false
+                        self.isBinding = false
+                        self.boundEndpoint = nil
+                        self.bindError = message
+                    }
+                }
             case .setup:
                 break
             case .cancelled:
@@ -153,26 +194,107 @@ final class AgentBridge {
         }
         listener.start(queue: .main)
         self.listener = listener
-        isRunning = true
+        // Not running until .ready — avoids advertising a dead bind.
+        isRunning = false
         print("[AgentBridge] bind=\(bindMode) (awaiting .ready)")
         Self.writeStatus("bind=\(bindMode) awaiting .ready")
     }
 
-    /// Explicit IPv4 loopback via `requiredLocalEndpoint` (no `on:` port).
-    private static func makeLoopbackListener(port: UInt16) throws -> NWListener {
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        let nwPort = NWEndpoint.Port(rawValue: port)!
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: nwPort)
-        return try NWListener(using: parameters)
+    /// Darwin bind to `host:port` with SO_REUSEADDR/SO_REUSEPORT off.
+    /// Succeeds only when nothing else owns the endpoint; socket is closed after.
+    nonisolated private static func assertExclusiveLoopbackPort(host: String, port: UInt16) throws {
+        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else {
+            throw AgentBridgeError.bindFailed("socket() failed errno=\(errno)")
+        }
+        defer { close(fd) }
+
+        var off: Int32 = 0
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &off, socklen_t(MemoryLayout.size(ofValue: off)))
+        #if os(macOS)
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &off, socklen_t(MemoryLayout.size(ofValue: off)))
+        #endif
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        let ok = host.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
+        guard ok == 1 else {
+            throw AgentBridgeError.bindFailed("inet_pton failed for \(host)")
+        }
+
+        let bindRC: Int32 = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bindRC != 0 {
+            let err = errno
+            if err == EADDRINUSE {
+                throw POSIXError(.EADDRINUSE)
+            }
+            throw AgentBridgeError.bindFailed("exclusive bind \(host):\(port) failed errno=\(err)")
+        }
+        // Hold briefly so a racing peer also sees the port taken, then release for NWListener.
+        _ = listen(fd, 1)
     }
 
-    /// Fallback: prefer loopback interface (may show as `*:port` in lsof).
-    private static func makeInterfaceLoopbackListener(port: UInt16) throws -> NWListener {
+    /// Explicit IPv4 loopback via `requiredLocalEndpoint` (no `on:`, no reuse, no wildcard).
+    private static func makeLoopbackListener(host: String, port: UInt16) throws -> (NWListener, NWParameters) {
         let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        parameters.requiredInterfaceType = .loopback
-        return try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        // Do NOT set allowLocalEndpointReuse — dual-bind of *:18765 relied on reuse
+        // plus the interfaceType=.loopback fallback. Exclusive preflight owns EADDRINUSE.
+        let nwPort = NWEndpoint.Port(rawValue: port)!
+        // String host form matches the bind that historically reached `.ready` under sandbox.
+        parameters.requiredLocalEndpoint = .hostPort(host: .init(host), port: nwPort)
+        return (try NWListener(using: parameters), parameters)
+    }
+
+    /// Real endpoint from `listener.port` + `parameters.requiredLocalEndpoint` (not a hardcoded string).
+    nonisolated private static func endpointLabel(
+        from listener: NWListener,
+        parameters: NWParameters,
+        fallbackPort: UInt16
+    ) -> String {
+        let portVal = listener.port?.rawValue ?? fallbackPort
+        if let endpoint = parameters.requiredLocalEndpoint,
+           case .hostPort(let host, _) = endpoint {
+            return "\(formatHost(host)):\(portVal)"
+        }
+        return "?:\(portVal)"
+    }
+
+    nonisolated private static func formatHost(_ host: NWEndpoint.Host) -> String {
+        switch host {
+        case .ipv4(let addr):
+            return "\(addr)"
+        case .ipv6(let addr):
+            return "\(addr)"
+        case .name(let name, _):
+            return name
+        @unknown default:
+            return "\(host)"
+        }
+    }
+
+    nonisolated private static func isAddressInUse(_ error: Error) -> Bool {
+        if let nw = error as? NWError, case .posix(let code) = nw, code == .EADDRINUSE {
+            return true
+        }
+        let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain && ns.code == Int(EADDRINUSE) {
+            return true
+        }
+        let desc = error.localizedDescription.lowercased()
+        return desc.contains("address already in use") || desc.contains("eaddrinuse")
+    }
+
+    nonisolated private static func describeBindFailure(_ error: Error, host: String, port: UInt16) -> String {
+        if isAddressInUse(error) {
+            return "bind EADDRINUSE on \(host):\(port) — another XDeck agent bridge already owns this port; quit the other instance (do not fall back to *:port)"
+        }
+        return "bind failed on \(host):\(port): \(error.localizedDescription)"
     }
 
     func stop() {
@@ -183,6 +305,9 @@ final class AgentBridge {
         }
         connections.removeAll()
         isRunning = false
+        isBinding = false
+        boundEndpoint = nil
+        bindError = nil
     }
 
     // MARK: - Token file

@@ -13,6 +13,7 @@
  *  8. G2 notifications — /notifications column returns typed notifications[]
  *  9. G3 isAd — status/conversation page can flag promoted cards (isAd)
  * 10. G4 articles — article search yields article.{title,preview} and/or media type article
+ * 11. Bind listener — exactly one TCP listener on 18765 and it is 127.0.0.1 (not *)
  *
  * Usage:
  *   node evals/scenarios.mjs
@@ -25,7 +26,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import readline from "node:readline";
 import {
   health,
@@ -1017,6 +1018,61 @@ async function scenario10Articles(column) {
   );
 }
 
+/** Assert exactly one TCP listener on 18765 and it is 127.0.0.1 (not * / ::). */
+async function scenario11BindListener() {
+  const port = 18765;
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  try {
+    stdout = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], {
+      encoding: "utf8",
+    });
+  } catch (err) {
+    exitCode = typeof err.status === "number" ? err.status : 1;
+    stdout = err.stdout?.toString?.() || err.stdout || "";
+    stderr = err.stderr?.toString?.() || err.stderr || "";
+  }
+
+  const lines = String(stdout)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("COMMAND"));
+
+  const listeners = lines.map((line) => {
+    const m = line.match(/TCP\s+(\S+):(\d+)\s+\(LISTEN\)/i);
+    return {
+      line,
+      addr: m ? m[1] : null,
+      port: m ? Number(m[2]) : null,
+    };
+  });
+
+  const wildcard = listeners.some(
+    (l) =>
+      l.addr === "*" ||
+      l.addr === "::" ||
+      l.addr === "[::]" ||
+      l.addr === "0.0.0.0"
+  );
+  const onlyLoopback =
+    listeners.length === 1 && listeners[0].addr === "127.0.0.1" && listeners[0].port === port;
+
+  if (onlyLoopback && !wildcard) {
+    return grade(true, false, "exactly one 127.0.0.1:18765 listener (no wildcard)", {
+      listeners,
+      lsof: stdout.trim(),
+    });
+  }
+
+  return grade(
+    false,
+    false,
+    `expected exactly one 127.0.0.1:${port} listener, got ${listeners.length} (wildcard=${wildcard})`,
+    { listeners, lsof: stdout.trim(), stderr: String(stderr).trim(), exitCode }
+  );
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
@@ -1120,6 +1176,12 @@ async function main() {
   };
   console.error(`  10 g4_articles: ${report.scenarios[10].status} — ${report.scenarios[10].reason}`);
 
+  report.scenarios[11] = {
+    name: "bind_listener",
+    ...(await scenario11BindListener()),
+  };
+  console.error(`  11 bind_listener: ${report.scenarios[11].status} — ${report.scenarios[11].reason}`);
+
   // Leave column on home for the next human/agent session.
   await timed(() => navigateColumn(opts.column, "https://x.com/home")).catch(() => {});
 
@@ -1135,6 +1197,7 @@ async function main() {
     8: report.scenarios[8].status,
     9: report.scenarios[9].status,
     10: report.scenarios[10].status,
+    11: report.scenarios[11].status,
   };
 
   const out = JSON.stringify(report, null, 2);

@@ -52,6 +52,8 @@ struct ContentView: View {
     @AppStorage("isDarkMode") var isDarkMode: Bool = false
     @AppStorage("hideAds") var hideAds: Bool = false
 
+    @ObservedObject private var agentBridge = AgentBridge.shared
+
     @State var isLoading: Bool = false
     @State var isShowingAlert: Bool = false
     @State var alertMessage: String? = nil
@@ -327,8 +329,13 @@ struct ContentView: View {
 
                                 ScrollView(.horizontal) {
                                     HStack(spacing: 24) {
-                                        if AgentBridge.shared.isRunning {
-                                            Text("Agent :\(AgentBridge.shared.port)")
+                                        if let bindError = agentBridge.bindError {
+                                            Text("Agent bind failed")
+                                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                                .foregroundColor(Color(hex: "#F4212E"))
+                                                .help(bindError)
+                                        } else if agentBridge.isRunning {
+                                            Text("Agent \(agentBridge.boundEndpoint ?? ":\(agentBridge.port)")")
                                                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                                 .foregroundColor(Color(hex: "#1D9BF0"))
                                                 .help("Localhost agent bridge is listening (XDECK_AGENT=1). Token: /Users/Shared/XDeck-agent/agent.token (or App Support/XDeck)")

@@ -510,6 +510,8 @@ enum AgentBridgeError: LocalizedError {
     /// Eval routes when `XDECK_AGENT_EVAL` is unset — HTTP **404** (unregistered).
     case evalDisabled
     case notImplemented(String)
+    /// Localhost bind failed (EADDRINUSE or other) — bridge is down; no wildcard fallback.
+    case bindFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -529,6 +531,8 @@ enum AgentBridgeError: LocalizedError {
             return "Eval disabled — set XDECK_AGENT_EVAL=1 on the XDeck process to enable POST /eval (HTTP 404 when unset)"
         case .notImplemented(let feature):
             return "\(feature) is not implemented. This bridge is a read/navigate lab telescope — no post/reply/like/click tools. Do not use eval_js to mutate the page unless a human explicitly asks."
+        case .bindFailed(let message):
+            return message
         }
     }
 
@@ -539,7 +543,7 @@ enum AgentBridgeError: LocalizedError {
         case .badRequest: return 400
         case .notImplemented: return 501
         case .methodNotAllowed: return 405
-        case .jsError: return 500
+        case .jsError, .bindFailed: return 500
         }
     }
 }
